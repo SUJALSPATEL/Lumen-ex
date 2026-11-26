@@ -26,6 +26,7 @@ from lumen_ex.privacy.generalization import AgeGeneralizer, LocationGeneralizer
 from lumen_ex.privacy.integrity import ClinicalIntegrityValidator
 from lumen_ex.privacy.pseudonym import Pseudonymizer
 from lumen_ex.privacy.risk import QuasiIdentifierRiskAnalyzer, RareValueSuppressor
+from lumen_ex.value_normalization import DateOrder
 
 
 _KEY_NORMALIZER = re.compile(r"[^a-z0-9]+")
@@ -192,6 +193,9 @@ class PrivacyTransformer:
             path=(),
             findings=item.detection.findings,
             patient_reference=patient_reference,
+            date_order=self.config.date_order_for_source(
+                record.source.relative_path
+            ),
             depth=0,
         )
         if not isinstance(transformed_fields, dict):
@@ -226,6 +230,7 @@ class PrivacyTransformer:
         path: tuple[str, ...],
         findings: tuple[DetectionFinding, ...],
         patient_reference: str,
+        date_order: DateOrder | None,
         depth: int,
     ) -> object:
         if depth > _MAX_DEPTH:
@@ -249,6 +254,7 @@ class PrivacyTransformer:
                     path=key_path,
                     findings=findings,
                     patient_reference=patient_reference,
+                    date_order=date_order,
                     depth=depth + 1,
                 )
                 if _KEY_NORMALIZER.sub("", key.casefold()) in _AGE_KEYS:
@@ -265,6 +271,7 @@ class PrivacyTransformer:
                     path=path + (str(index),),
                     findings=findings,
                     patient_reference=patient_reference,
+                    date_order=date_order,
                     depth=depth + 1,
                 )
                 for index, child in enumerate(value)
@@ -276,6 +283,7 @@ class PrivacyTransformer:
                     path=path + (str(index),),
                     findings=findings,
                     patient_reference=patient_reference,
+                    date_order=date_order,
                     depth=depth + 1,
                 )
                 for index, child in enumerate(value)
@@ -288,7 +296,9 @@ class PrivacyTransformer:
                 and _source_path_matches(finding.source_key, path)
             )
             text = _rewrite_text(value, value_findings, self._age_generalizer)
-            return self._date_shifter.shift_text(text, patient_reference)
+            return self._date_shifter.shift_text(
+                text, patient_reference, date_order=date_order
+            )
         if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
             if isinstance(value, (float, Decimal)) and not math.isfinite(value):
                 raise ProcessingError("invalid_record")

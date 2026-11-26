@@ -43,12 +43,33 @@ class ConfigurationTests(unittest.TestCase):
             "unexpected: 2\n",
             "min_group_size: nope\n",
             "location_hierarchy: village,state,district\n",
+            "date_order_overrides: registration/unknown=guess\n",
+            "date_order_overrides: ../outside=dmy\n",
+            "date_order_overrides: registration//bad=dmy\n",
         ):
             with self.subTest(content=content), tempfile.TemporaryDirectory() as temporary:
                 path = Path(temporary) / "policy.yaml"
                 path.write_text(content, encoding="utf-8")
                 with self.assertRaises(ConfigurationError):
                     load_config(path)
+
+    def test_source_date_order_overrides_are_specific_and_unknowns_stay_unset(self) -> None:
+        config = load_config()
+        self.assertEqual(
+            config.date_order_for_source(
+                "registration/sanjeevani_registration (1).csv"
+            ),
+            "dmy",
+        )
+        self.assertEqual(
+            config.date_order_for_source(
+                "registration/arogya_legacy_export.csv"
+            ),
+            "mdy",
+        )
+        self.assertIsNone(
+            config.date_order_for_source("misc/unknown_dates.txt")
+        )
 
 
 class ContractTests(unittest.TestCase):

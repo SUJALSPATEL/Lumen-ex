@@ -62,6 +62,19 @@ class DateTransformationTests(unittest.TestCase):
             DateShifter("date-secret").shift_text("01/02/2020", "cluster-a")
         self.assertEqual(raised.exception.code, "privacy_date_format_ambiguous")
 
+    def test_source_date_order_resolves_ambiguous_dates_without_global_guessing(self) -> None:
+        shifter = DateShifter("date-secret")
+        original_dmy = date_from_iso("2020-02-01")
+        original_mdy = date_from_iso("2020-01-02")
+        self.assertEqual(
+            shifter.shift_text("01/02/2020", "cluster-a", date_order="dmy"),
+            shifter.shift(original_dmy, "cluster-a").isoformat(),
+        )
+        self.assertEqual(
+            shifter.shift_text("01/02/2020", "cluster-a", date_order="mdy"),
+            shifter.shift(original_mdy, "cluster-a").isoformat(),
+        )
+
     def test_unambiguous_numeric_dates_are_emitted_in_iso_format(self) -> None:
         shifter = DateShifter("date-secret")
         shifted = shifter.shift_text("11/11/2020 to 2020/11/13", "cluster-a")
@@ -137,6 +150,51 @@ class RiskAssessmentTests(unittest.TestCase):
 
 
 class PrivacyTransformerTests(unittest.TestCase):
+    def test_transformer_uses_documented_source_date_order_only(self) -> None:
+        config = PipelineConfig(min_group_size=5)
+        transformer = PrivacyTransformer("privacy-secret", config)
+        inputs = []
+        for index in range(5):
+            record = _record(
+                index,
+                {"event_date": "01/02/2020", "diagnosis": "common condition"},
+            )
+            source = InputFileMetadata(
+                relative_path="registration/arogya_legacy_export.csv",
+                sha256=record.source.sha256,
+                size_bytes=record.source.size_bytes,
+            )
+            inputs.append(
+                PrivacyInput(
+                    NormalizedRecord(source, record.locator, record.fields),
+                    DetectionResult(identifier_count=0),
+                    LinkageDecision(LinkageAction.LINK, "shared-cluster"),
+                )
+            )
+
+        results = transformer.transform_batch(tuple(inputs))
+        expected = DateShifter("privacy-secret", config.date_shift_max_days).shift_text(
+            "01/02/2020", "shared-cluster", date_order="mdy"
+        )
+        self.assertTrue(
+            all(result.status is ProcessingStatus.SANITIZED for result in results)
+        )
+        self.assertTrue(
+            all(result.output_fields["event_date"] == expected for result in results)
+        )
+
+        unknown = _record(
+            10,
+            {"event_date": "01/02/2020", "diagnosis": "common condition"},
+        )
+        result = transformer.transform(
+            unknown,
+            DetectionResult(identifier_count=0),
+            LinkageDecision(LinkageAction.DO_NOT_LINK),
+        )
+        self.assertEqual(result.status, ProcessingStatus.QUARANTINED)
+        self.assertEqual(result.error_code, "privacy_date_format_ambiguous")
+
     def test_cohort_transform_redacts_pii_and_preserves_clinical_values(self) -> None:
         transformer = PrivacyTransformer("privacy-secret", PipelineConfig(min_group_size=5))
         inputs = tuple(

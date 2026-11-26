@@ -62,6 +62,14 @@ class ScalarNormalizationTests(unittest.TestCase):
         self.assertEqual(normalize_date("13/04/1982"), "1982-04-13")
         self.assertEqual(normalize_date("04/13/1982"), "1982-04-13")
         self.assertIsNone(normalize_date("04/05/1982"))
+        self.assertEqual(
+            normalize_date("04/05/1982", date_order="dmy"),
+            "1982-05-04",
+        )
+        self.assertEqual(
+            normalize_date("04/05/1982", date_order="mdy"),
+            "1982-04-05",
+        )
         self.assertIsNone(normalize_date("31/02/1982"))
         self.assertIsNone(normalize_date("1982-04-13garbage"))
         self.assertIsNone(normalize_date("1982-04-13T23:59:00Z"))

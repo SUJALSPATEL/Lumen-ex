@@ -7,7 +7,7 @@ import re
 
 from lumen_ex.errors import ProcessingError
 from lumen_ex.key_derivation import derive_key
-from lumen_ex.value_normalization import normalize_date
+from lumen_ex.value_normalization import DateOrder, normalize_date
 
 
 _DATE_TOKEN = re.compile(
@@ -49,16 +49,22 @@ class DateShifter:
         except OverflowError:
             raise ProcessingError("privacy_date_out_of_range") from None
 
-    def shift_text(self, text: str, patient_reference: str) -> str:
+    def shift_text(
+        self,
+        text: str,
+        patient_reference: str,
+        *,
+        date_order: DateOrder | None = None,
+    ) -> str:
         offset = self.offset_for(patient_reference)
 
         def replace(match: re.Match[str]) -> str:
             token = match.group(0)
             if _ISO_DATETIME.fullmatch(token):
                 return _shift_datetime_token(token, offset)
-            normalized = normalize_date(token)
+            normalized = normalize_date(token, date_order=date_order)
             if normalized is None:
-                if _is_ambiguous_date(token):
+                if date_order is None and _is_ambiguous_date(token):
                     raise ProcessingError("privacy_date_format_ambiguous")
                 raise ProcessingError("privacy_date_invalid")
             shifted = _shift_date(date.fromisoformat(normalized), offset)
