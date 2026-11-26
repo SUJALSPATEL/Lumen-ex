@@ -141,11 +141,18 @@ class SanitizedOutputWriter:
         source: InputFileMetadata,
         records: Sequence[ReleaseRecord],
     ) -> FileWriteResult:
-        if any(item.result.status is ProcessingStatus.QUARANTINED for item in records):
+        quarantined = tuple(
+            item
+            for item in records
+            if item.result.status is ProcessingStatus.QUARANTINED
+        )
+        if quarantined and not any(
+            item.result.status is ProcessingStatus.SANITIZED
+            for item in records
+        ):
             reason = next(
                 item.result.error_code
-                for item in records
-                if item.result.status is ProcessingStatus.QUARANTINED
+                for item in quarantined
             )
             return self._quarantine(source, reason or "internal_error", len(records))
 
@@ -170,6 +177,14 @@ class SanitizedOutputWriter:
                     value
                     for item in records
                     for value in item.sensitive_values
+                ),
+                allow_cohort_quasi_identifiers=all(
+                    item.result.status is not ProcessingStatus.SANITIZED
+                    or (
+                        item.result.generalized
+                        and item.result.risk_assessment is not None
+                    )
+                    for item in records
                 ),
             ) or not all(self._scanner.scan_value(entry) for entry in entries):
                 return self._quarantine(source, "leak_scan_failed", len(records))
@@ -197,6 +212,7 @@ class SanitizedOutputWriter:
                 source.sha256, output_path, ProcessingStatus.SANITIZED
             ),
             tuple(entries),
+            records_quarantined=len(quarantined),
         )
 
     def _output_path(
@@ -296,7 +312,10 @@ class SanitizedOutputWriter:
         entries: list[dict[str, object]] = []
         output_row = 0
         for item in records:
-            if item.result.status is ProcessingStatus.SUPPRESSED:
+            if item.result.status in {
+                ProcessingStatus.SUPPRESSED,
+                ProcessingStatus.QUARANTINED,
+            }:
                 continue
             fields = copy.deepcopy(item.result.output_fields)
             patient = _inject_patient_reference(item, fields)
@@ -398,7 +417,11 @@ class SanitizedOutputWriter:
             removed_before = sum(
                 1
                 for other_segments, other, _, _ in pointers
-                if other.result.status is ProcessingStatus.SUPPRESSED
+                if other.result.status
+                in {
+                    ProcessingStatus.SUPPRESSED,
+                    ProcessingStatus.QUARANTINED,
+                }
                 and other_segments[:-1] == parent
                 and _array_index(other_segments[-1]) < index
             )
@@ -413,9 +436,12 @@ class SanitizedOutputWriter:
             ),
             reverse=True,
         ):
-            if item.result.status is ProcessingStatus.SUPPRESSED:
+            if item.result.status in {
+                ProcessingStatus.SUPPRESSED,
+                ProcessingStatus.QUARANTINED,
+            }:
                 _remove_pointer(document, segments)
-            else:
+            elif item.result.status is ProcessingStatus.SANITIZED:
                 _set_pointer(document, segments, replacement)
 
         for _, item, _, patient in pointers:

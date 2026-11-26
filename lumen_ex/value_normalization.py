@@ -2,8 +2,12 @@
 
 from datetime import date, datetime
 import re
+from typing import Literal
 import unicodedata
 
+
+DateOrder = Literal["dmy", "mdy"]
+AmbiguousDateAction = Literal["redact", "quarantine"]
 
 _AGE = re.compile(
     r"^\s*(\d{1,3})(?:\s*(?:years?|yrs?|y|saal|sal|varsh|वर्ष|साल))?"
@@ -19,10 +23,18 @@ _DATE_FORMATS = (
     "%m/%d/%Y",
     "%m-%d-%Y",
 )
+_ORDERED_DATE_FORMATS: dict[DateOrder, tuple[str, ...]] = {
+    "dmy": ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y"),
+    "mdy": ("%m/%d/%Y", "%m-%d-%Y", "%m.%d.%Y"),
+}
 
 
-def normalize_date(value: str | date | datetime) -> str | None:
-    """Return a calendar date as ISO, refusing ambiguous numeric dates."""
+def normalize_date(
+    value: str | date | datetime,
+    *,
+    date_order: DateOrder | None = None,
+) -> str | None:
+    """Return a calendar date as ISO, refusing ambiguous dates without a source hint."""
     if isinstance(value, datetime):
         return value.date().isoformat()
     if isinstance(value, date):
@@ -35,16 +47,23 @@ def normalize_date(value: str | date | datetime) -> str | None:
         return date.fromisoformat(text).isoformat()
     except ValueError:
         pass
-    for date_format in _DATE_FORMATS:
+    date_formats = (
+        ("%Y/%m/%d",) + _ORDERED_DATE_FORMATS[date_order]
+        if date_order is not None
+        else _DATE_FORMATS
+    )
+    for date_format in date_formats:
         try:
             parsed = datetime.strptime(text, date_format).date()
         except ValueError:
             continue
-        if date_format in {"%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y"}:
-            first, second = _date_components(text, date_format)
-            if first <= 12 and second <= 12 and first != second:
-                return None
-        elif date_format in {"%m/%d/%Y", "%m-%d-%Y"}:
+        if date_order is None and date_format in {
+            "%d/%m/%Y",
+            "%d-%m-%Y",
+            "%d.%m.%Y",
+            "%m/%d/%Y",
+            "%m-%d-%Y",
+        }:
             first, second = _date_components(text, date_format)
             if first <= 12 and second <= 12 and first != second:
                 return None

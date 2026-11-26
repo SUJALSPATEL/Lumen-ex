@@ -49,12 +49,16 @@ or `leak_scan_failed`, never raw exception text.
 ## Identity projection
 
 `PatientIdentity` in `lumen_ex.contracts.identity` contains only identity attributes
-and their `IdentityValue(original, normalized, source_key)` entries. Supported
-attributes are patient and relative names, date of birth, age, gender, phone, email,
-address, location, hospital-specific identifier, government/health identifier, and
-insurance identifier.
-It also records the source file and record locator, missing and malformed fields, and
-normalization metadata. Source values and locators are excluded from object
+and their `IdentityValue(original, normalized, source_key, namespace)` entries.
+Supported attributes are patient and relative names, date of birth, age, gender, phone,
+email, address, location, hospital-specific identifier, government/health identifier,
+and insurance identifier. Hospital identifier namespaces retain an explicit issuer
+when available, such as FHIR `Identifier.system`; `source_system` retains one
+unambiguous explicitly labeled source/facility/issuer value. Both are internal metadata
+and are excluded from object representations. Ambiguous source metadata is not
+arbitrarily selected.
+The projection also records the source file and record locator, missing and malformed
+fields, and normalization metadata. Source values and locators are excluded from object
 representations to reduce accidental logging exposure. The projection deliberately does
 not retain the complete medical record.
 
@@ -103,12 +107,16 @@ The governing format is the starter kit's `docs/SPEC.md`, not these internal mod
   `file`, `loc`, and `patient` keys. No new required fields are introduced.
 - Output paths remain relative to the output root; hashes identify inputs without
   exposing source filenames in the report.
+- Sanitized paths include a keyed opaque source token. It is used for path grouping and
+  does not add fields to `records.jsonl`.
 - `PatientIdentity` and its `NormalizedRecord` projections are internal contracts only.
   They do not change `records.jsonl` or the report schema. The release writer places a
   pseudonym in an existing identity field only when that mapping is reliable.
 
-`SanitizedOutputWriter` serializes complete source files only after all records in a
-file are sanitized and scanned. CSV/TSV retain their delimiter and header (files with
+`SanitizedOutputWriter` serializes source files only after every emitted record passes
+checks. A record-level quarantine can be omitted from CSV/TSV or JSON while other safe
+records are retained; the final artifact is still scanned as a whole. If no safe
+record remains, the file is quarantined. CSV/TSV retain their delimiter and header (files with
 duplicate headers are quarantined because their values cannot be mapped unambiguously).
 JSON records are replaced using their input JSON Pointers; suppressed array items are
 removed and reported with an output locator when indices shift. Text output is UTF-8.

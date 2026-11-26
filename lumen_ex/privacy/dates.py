@@ -7,7 +7,11 @@ import re
 
 from lumen_ex.errors import ProcessingError
 from lumen_ex.key_derivation import derive_key
-from lumen_ex.value_normalization import normalize_date
+from lumen_ex.value_normalization import (
+    AmbiguousDateAction,
+    DateOrder,
+    normalize_date,
+)
 
 
 _DATE_TOKEN = re.compile(
@@ -19,16 +23,25 @@ _DATE_TOKEN = re.compile(
     r")(?!\d)"
 )
 _ISO_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2}[T ].+")
+_REDACTED_DATE = "[DATE REDACTED]"
 
 
 class DateShifter:
-    def __init__(self, secret: str | bytes, max_days: int = 180) -> None:
+    def __init__(
+        self,
+        secret: str | bytes,
+        max_days: int = 180,
+        ambiguous_date_action: AmbiguousDateAction = "redact",
+    ) -> None:
         if not isinstance(secret, (str, bytes)) or not secret:
             raise ProcessingError("secret_missing")
         if isinstance(max_days, bool) or not isinstance(max_days, int) or max_days < 1:
             raise ProcessingError("privacy_policy_invalid")
+        if ambiguous_date_action not in {"redact", "quarantine"}:
+            raise ProcessingError("privacy_policy_invalid")
         self._key = derive_key(secret, b"patient-date-shift")
         self.max_days = max_days
+        self.ambiguous_date_action = ambiguous_date_action
 
     def offset_for(self, patient_reference: str) -> int:
         if not isinstance(patient_reference, str) or not patient_reference:
@@ -49,22 +62,34 @@ class DateShifter:
         except OverflowError:
             raise ProcessingError("privacy_date_out_of_range") from None
 
-    def shift_text(self, text: str, patient_reference: str) -> str:
+    def shift_text(
+        self,
+        text: str,
+        patient_reference: str,
+        *,
+        date_order: DateOrder | None = None,
+    ) -> str:
         offset = self.offset_for(patient_reference)
 
         def replace(match: re.Match[str]) -> str:
             token = match.group(0)
             if _ISO_DATETIME.fullmatch(token):
                 return _shift_datetime_token(token, offset)
-            normalized = normalize_date(token)
+            normalized = normalize_date(token, date_order=date_order)
             if normalized is None:
-                if _is_ambiguous_date(token):
+                if date_order is None and _is_ambiguous_date(token):
+                    if self.ambiguous_date_action == "redact":
+                        return _REDACTED_DATE
                     raise ProcessingError("privacy_date_format_ambiguous")
                 raise ProcessingError("privacy_date_invalid")
             shifted = _shift_date(date.fromisoformat(normalized), offset)
             return shifted.isoformat()
 
         return _DATE_TOKEN.sub(replace, text)
+
+
+def canonicalize_date_tokens(text: str) -> str:
+    return _DATE_TOKEN.sub("[DATE]", text).replace(_REDACTED_DATE, "[DATE]")
 
 
 def _shift_date(value: date, offset: int) -> date:

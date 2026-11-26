@@ -12,6 +12,7 @@ from typing import Sequence
 from lumen_ex.config import PipelineConfig
 from lumen_ex.contracts.identity import IdentityDecision
 from lumen_ex.contracts.models import (
+    DetectionEntityType,
     DetectionResult,
     IngestionStatus,
     LinkageAction,
@@ -248,6 +249,9 @@ class ReleasePipeline:
                 for value in identity.name
             )
 
+        source_namespaces = _source_namespaces_by_file(
+            records, normalized_by_record
+        )
         for parsed in records:
             key = (parsed.source.relative_path, parsed.locator)
             normalized = NormalizedRecord(
@@ -270,12 +274,19 @@ class ReleasePipeline:
                 )
                 for entity, count in detection.entity_counts.items():
                     entity_counts[entity] = entity_counts.get(entity, 0) + count
-                namespace = parsed.source.sha256
+                namespace = source_namespaces[parsed.source.relative_path]
                 if namespace not in matchers:
                     matchers[namespace] = IdentityMatcher(registry, hospital_namespace=namespace)
                 linkage, linked = self._link_record(normalized, matchers[namespace], registry)
                 privacy_indices.append(len(prepared))
-                privacy_inputs.append(PrivacyInput(normalized, detection, linkage))
+                privacy_inputs.append(
+                    PrivacyInput(
+                        normalized,
+                        detection,
+                        linkage,
+                        source_namespace=namespace,
+                    )
+                )
                 prepared.append(
                     _PreparedRecord(
                         parsed, normalized, detection, linkage,
@@ -323,6 +334,19 @@ class ReleasePipeline:
         transformed = transformer.transform_batch(privacy_inputs)
         for prepared_index, result in zip(privacy_indices, transformed):
             item = prepared[prepared_index]
+            if (
+                result.status is ProcessingStatus.SANITIZED
+                and not self.leak_scanner.is_safe(
+                    result,
+                    sensitive_values=_sensitive_values(item),
+                )
+            ):
+                result = SanitizationResult(
+                    ProcessingStatus.QUARANTINED,
+                    result.locator,
+                    error_code="leak_scan_failed",
+                    identifiers_detected=result.identifiers_detected,
+                )
             prepared[prepared_index] = _PreparedRecord(
                 item.parsed,
                 item.normalized,
@@ -399,6 +423,33 @@ class ReleasePipeline:
             raise ProcessingError("filesystem_error") from None
 
 
+def _source_namespaces_by_file(
+    records: Sequence[ParsedRecord],
+    normalized_by_record: dict[tuple[str, str], NormalizedRecord],
+) -> dict[str, str]:
+    candidates: dict[str, set[str]] = defaultdict(set)
+    for (relative_path, _), normalized in normalized_by_record.items():
+        for identity in normalized.identities:
+            if identity.source_system:
+                candidates[relative_path].add(identity.source_system)
+            candidates[relative_path].update(
+                value.namespace
+                for value in identity.hospital_identifier
+                if value.namespace
+            )
+
+    namespaces: dict[str, str] = {}
+    for parsed in records:
+        relative_path = parsed.source.relative_path
+        source_candidates = candidates[relative_path]
+        namespaces[relative_path] = (
+            next(iter(source_candidates))
+            if len(source_candidates) == 1
+            else f"file:{parsed.source.sha256}"
+        )
+    return namespaces
+
+
 def _peak_rss_mb() -> float:
     if platform.system() == "Windows":
         import ctypes
@@ -453,7 +504,10 @@ def _sensitive_values(item: _PreparedRecord) -> tuple[str, ...]:
     values = {
         finding.value
         for finding in item.detection.findings
-        if len(finding.value) >= 4
+        if (
+            len(finding.value) >= 4
+            and finding.entity_type is not DetectionEntityType.GENDER
+        )
     }
     for identity in item.normalized.identities:
         for field_name in (

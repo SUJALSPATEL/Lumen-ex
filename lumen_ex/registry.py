@@ -210,11 +210,17 @@ class EncryptedIdentityRegistry:
             for field_name in _FIELDS:
                 field_values: tuple[IdentityValue, ...] = getattr(identity, field_name)
                 for position, field_value in enumerate(field_values):
+                    block_namespace = (
+                        field_value.namespace or identity.source_system or namespace
+                        if field_name == "hospital_identifier"
+                        else None
+                    )
                     payload = _json_bytes(
                         {
                             "original": field_value.original,
                             "normalized": field_value.normalized,
                             "source_key": field_value.source_key,
+                            "namespace": block_namespace,
                         }
                     )
                     ciphertext = self._encrypt(
@@ -230,14 +236,11 @@ class EncryptedIdentityRegistry:
                         (record_key, patient_id, field_name, position, ciphertext),
                     )
                     if field_value.normalized is not None:
-                        index_namespace = (
-                            namespace if field_name == "hospital_identifier" else ""
-                        )
                         self.add_block(
                             patient_id,
                             field_name,
                             field_value.normalized,
-                            index_namespace,
+                            block_namespace or "",
                         )
 
     def add_block(
@@ -399,6 +402,7 @@ class EncryptedIdentityRegistry:
                     original=payload["original"],
                     normalized=payload["normalized"],
                     source_key=payload["source_key"],
+                    namespace=payload.get("namespace"),
                 )
             )
 

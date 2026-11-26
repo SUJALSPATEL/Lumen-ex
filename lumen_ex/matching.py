@@ -104,14 +104,29 @@ class IdentityMatcher:
         values = _normalized_values(identity)
         candidates: dict[str, set[str]] = {}
         for field_name in _BLOCK_FIELDS:
-            if field_name == "hospital_identifier" and not self.hospital_namespace:
+            if field_name == "hospital_identifier":
+                for value in identity.hospital_identifier:
+                    normalized = value.normalized
+                    namespace = _identifier_namespace(
+                        value, identity.source_system, self.hospital_namespace
+                    )
+                    if not normalized or not namespace:
+                        continue
+                    for patient_id in self.registry.iter_resolved_candidate_ids(
+                        field_name, normalized, namespace
+                    ):
+                        candidates.setdefault(patient_id, set()).add(field_name)
+                        if len(candidates) > self.candidate_limit:
+                            return IdentityMatchResult(
+                                IdentityDecision.UNRESOLVED,
+                                None,
+                                0.0,
+                                "candidate_limit_exceeded",
+                            )
                 continue
-            namespace = (
-                self.hospital_namespace if field_name == "hospital_identifier" else ""
-            )
             for value in values[field_name]:
                 for patient_id in self.registry.iter_resolved_candidate_ids(
-                    field_name, value, namespace
+                    field_name, value, ""
                 ):
                     candidates.setdefault(patient_id, set()).add(field_name)
                     if len(candidates) > self.candidate_limit:
@@ -123,7 +138,12 @@ class IdentityMatcher:
                         )
 
         if not candidates:
-            if _sufficient_for_create(values, bool(self.hospital_namespace)):
+            has_hospital_namespace = bool(
+                identity.source_system
+                or self.hospital_namespace
+                or any(value.namespace for value in identity.hospital_identifier)
+            )
+            if _sufficient_for_create(values, has_hospital_namespace):
                 return IdentityMatchResult(
                     IdentityDecision.CREATE, None, 0.9, "no_existing_candidate"
                 )
@@ -137,7 +157,9 @@ class IdentityMatcher:
         scores = tuple(
             sorted(
                 (
-                    self._score_candidate(patient_id, block_matches, values)
+                    self._score_candidate(
+                        patient_id, block_matches, values, identity
+                    )
                     for patient_id, block_matches in candidates.items()
                 ),
                 key=lambda candidate: (-candidate.confidence, candidate.patient_id),
@@ -186,6 +208,7 @@ class IdentityMatcher:
         patient_id: str,
         block_matches: set[str],
         values: dict[str, set[str]],
+        identity: PatientIdentity,
     ) -> CandidateScore:
         exact_fields = set(block_matches)
         evidence: set[str] = set()
@@ -224,6 +247,18 @@ class IdentityMatcher:
                     exact_fields.add("age")
                 else:
                     evidence.add("age_near")
+            elif field_name == "hospital_identifier":
+                if normalized in values.get(field_name, set()) and any(
+                    current.normalized == normalized
+                    and _identifier_namespace(
+                        current,
+                        identity.source_system,
+                        self.hospital_namespace,
+                    )
+                    == stored_value.namespace
+                    for current in identity.hospital_identifier
+                ):
+                    exact_fields.add(field_name)
             elif normalized in values.get(field_name, set()):
                 exact_fields.add(field_name)
 
@@ -240,13 +275,16 @@ class IdentityMatcher:
             evidence.add("relative_name_similar")
 
         hard_conflict = False
-        if self.hospital_namespace:
-            for identifier in values["hospital_identifier"]:
+        for identifier in identity.hospital_identifier:
+            identifier_namespace = _identifier_namespace(
+                identifier, identity.source_system, self.hospital_namespace
+            )
+            if identifier.normalized and identifier_namespace:
                 if self.registry.has_conflicting_block(
                     patient_id,
                     "hospital_identifier",
-                    identifier,
-                    self.hospital_namespace,
+                    identifier.normalized,
+                    identifier_namespace,
                 ):
                     hard_conflict = True
                     evidence.add("hospital_identifier_conflict")
@@ -304,6 +342,14 @@ def _normalized_values(identity: PatientIdentity) -> dict[str, set[str]]:
         and _is_village_source(value.source_key)
     }
     return result
+
+
+def _identifier_namespace(
+    value: IdentityValue,
+    source_system: str | None,
+    fallback: str,
+) -> str:
+    return value.namespace or source_system or fallback
 
 
 def _evidence_confidence(

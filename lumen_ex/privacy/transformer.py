@@ -2,7 +2,7 @@
 
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 import math
 from pathlib import PurePosixPath
@@ -26,6 +26,7 @@ from lumen_ex.privacy.generalization import AgeGeneralizer, LocationGeneralizer
 from lumen_ex.privacy.integrity import ClinicalIntegrityValidator
 from lumen_ex.privacy.pseudonym import Pseudonymizer
 from lumen_ex.privacy.risk import QuasiIdentifierRiskAnalyzer, RareValueSuppressor
+from lumen_ex.value_normalization import DateOrder
 
 
 _KEY_NORMALIZER = re.compile(r"[^a-z0-9]+")
@@ -68,6 +69,7 @@ class PrivacyInput:
     record: NormalizedRecord
     detection: DetectionResult
     linkage: LinkageDecision
+    source_namespace: str | None = field(default=None, repr=False)
 
 
 class PrivacyTransformer:
@@ -80,7 +82,11 @@ class PrivacyTransformer:
     ) -> None:
         self.config = config or PipelineConfig()
         self._pseudonymizer = Pseudonymizer(secret)
-        self._date_shifter = DateShifter(secret, self.config.date_shift_max_days)
+        self._date_shifter = DateShifter(
+            secret,
+            self.config.date_shift_max_days,
+            self.config.ambiguous_date_action,
+        )
         self._age_generalizer = AgeGeneralizer(self.config.age_band_years)
         self._location_generalizer = LocationGeneralizer(
             self.config.location_hierarchy
@@ -192,6 +198,9 @@ class PrivacyTransformer:
             path=(),
             findings=item.detection.findings,
             patient_reference=patient_reference,
+            date_order=self.config.date_order_for_source(
+                record.source.relative_path
+            ),
             depth=0,
         )
         if not isinstance(transformed_fields, dict):
@@ -200,7 +209,12 @@ class PrivacyTransformer:
         self._integrity_validator.validate(original_fields, fields)
 
         structure = self._safe_structure(record, item.detection.findings)
-        output_relative_path = self._output_relative_path(record, item.detection.findings)
+        source_namespace = item.source_namespace or f"file:{record.source.sha256}"
+        output_relative_path = self._output_relative_path(
+            record,
+            item.detection.findings,
+            source_namespace,
+        )
         _verify_findings_removed(
             item.detection.findings,
             fields,
@@ -226,6 +240,7 @@ class PrivacyTransformer:
         path: tuple[str, ...],
         findings: tuple[DetectionFinding, ...],
         patient_reference: str,
+        date_order: DateOrder | None,
         depth: int,
     ) -> object:
         if depth > _MAX_DEPTH:
@@ -249,6 +264,7 @@ class PrivacyTransformer:
                     path=key_path,
                     findings=findings,
                     patient_reference=patient_reference,
+                    date_order=date_order,
                     depth=depth + 1,
                 )
                 if _KEY_NORMALIZER.sub("", key.casefold()) in _AGE_KEYS:
@@ -265,6 +281,7 @@ class PrivacyTransformer:
                     path=path + (str(index),),
                     findings=findings,
                     patient_reference=patient_reference,
+                    date_order=date_order,
                     depth=depth + 1,
                 )
                 for index, child in enumerate(value)
@@ -276,6 +293,7 @@ class PrivacyTransformer:
                     path=path + (str(index),),
                     findings=findings,
                     patient_reference=patient_reference,
+                    date_order=date_order,
                     depth=depth + 1,
                 )
                 for index, child in enumerate(value)
@@ -288,7 +306,9 @@ class PrivacyTransformer:
                 and _source_path_matches(finding.source_key, path)
             )
             text = _rewrite_text(value, value_findings, self._age_generalizer)
-            return self._date_shifter.shift_text(text, patient_reference)
+            return self._date_shifter.shift_text(
+                text, patient_reference, date_order=date_order
+            )
         if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
             if isinstance(value, (float, Decimal)) and not math.isfinite(value):
                 raise ProcessingError("invalid_record")
@@ -340,15 +360,19 @@ class PrivacyTransformer:
         self,
         record: NormalizedRecord,
         findings: Sequence[DetectionFinding],
+        source_namespace: str,
     ) -> str:
         source_path = PurePosixPath(record.source.relative_path.replace("\\", "/"))
+        source_directory = (
+            f"sanitized/src_{self._pseudonymizer.source_token(source_namespace)}"
+        )
         if not any(finding.channel is DetectionChannel.FILENAME for finding in findings):
-            return f"sanitized/{source_path}"
+            return f"{source_directory}/{source_path}"
         suffix = source_path.suffix.casefold()
         if suffix not in {".csv", ".tsv", ".txt", ".json"}:
             suffix = ".dat"
         token = self._pseudonymizer.filename_token(record.source.sha256)
-        return f"sanitized/file_{token}{suffix}"
+        return f"{source_directory}/file_{token}{suffix}"
 
 
 def _rewrite_text(

@@ -20,6 +20,7 @@ class Pseudonymizer:
             raise ProcessingError("secret_missing")
         self._key = derive_key(secret, b"patient-pseudonym")
         self._file_key = derive_key(secret, b"file-name-pseudonym")
+        self._source_key = derive_key(secret, b"source-system-code")
 
     def pseudonym_for(self, patient_reference: str) -> str:
         if not isinstance(patient_reference, str) or not patient_reference:
@@ -51,6 +52,19 @@ class Pseudonymizer:
         return hmac.new(
             self._file_key,
             b"lumen-ex/file-name/v1\0" + source_sha256.encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()[:20]
+
+    def source_token(self, source_namespace: str) -> str:
+        if (
+            not isinstance(source_namespace, str)
+            or not source_namespace
+            or len(source_namespace) > 2048
+        ):
+            raise ProcessingError("invalid_record")
+        return hmac.new(
+            self._source_key,
+            b"lumen-ex/source-system/v1\0" + source_namespace.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()[:20]
 

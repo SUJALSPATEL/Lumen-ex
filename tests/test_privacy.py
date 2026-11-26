@@ -16,8 +16,13 @@ from lumen_ex.contracts.models import (
 from lumen_ex.errors import ProcessingError
 from lumen_ex.privacy.dates import DateShifter
 from lumen_ex.privacy.generalization import AgeGeneralizer, LocationGeneralizer
+from lumen_ex.privacy.integrity import ClinicalIntegrityValidator
 from lumen_ex.privacy.pseudonym import Pseudonymizer
-from lumen_ex.privacy.risk import QuasiIdentifierRiskAnalyzer, RareValueSuppressor
+from lumen_ex.privacy.risk import (
+    QuasiIdentifierRiskAnalyzer,
+    RareValueSuppressor,
+    extract_quasi_identifiers,
+)
 from lumen_ex.privacy.transformer import PrivacyInput, PrivacyTransformer
 
 
@@ -34,6 +39,18 @@ class PseudonymizationTests(unittest.TestCase):
             first.pseudonym_for("patient-cluster"),
         )
         self.assertNotIn("patient-cluster", repr(first))
+
+    def test_source_tokens_are_stable_secret_scoped_and_opaque(self) -> None:
+        source = "urn:clinic:private-west"
+        first = Pseudonymizer("first-secret")
+        same_secret = Pseudonymizer("first-secret")
+        other_secret = Pseudonymizer("second-secret")
+
+        token = first.source_token(source)
+        self.assertEqual(token, same_secret.source_token(source))
+        self.assertNotEqual(token, other_secret.source_token(source))
+        self.assertEqual(len(token), 20)
+        self.assertNotIn(source, token)
 
 
 class DateTransformationTests(unittest.TestCase):
@@ -57,10 +74,33 @@ class DateTransformationTests(unittest.TestCase):
             shifter.offset_for("cluster-b"),
         )
 
-    def test_ambiguous_dates_fail_closed(self) -> None:
+    def test_ambiguous_dates_are_redacted_without_order_hint(self) -> None:
+        shifter = DateShifter("date-secret")
+        self.assertEqual(
+            shifter.shift_text("Seen 01/02/2020; BP 120/80", "cluster-a"),
+            "Seen [DATE REDACTED]; BP 120/80",
+        )
+
+    def test_ambiguous_dates_can_be_configured_to_fail_closed(self) -> None:
         with self.assertRaises(ProcessingError) as raised:
-            DateShifter("date-secret").shift_text("01/02/2020", "cluster-a")
+            DateShifter(
+                "date-secret",
+                ambiguous_date_action="quarantine",
+            ).shift_text("01/02/2020", "cluster-a")
         self.assertEqual(raised.exception.code, "privacy_date_format_ambiguous")
+
+    def test_source_date_order_resolves_ambiguous_dates_without_global_guessing(self) -> None:
+        shifter = DateShifter("date-secret")
+        original_dmy = date_from_iso("2020-02-01")
+        original_mdy = date_from_iso("2020-01-02")
+        self.assertEqual(
+            shifter.shift_text("01/02/2020", "cluster-a", date_order="dmy"),
+            shifter.shift(original_dmy, "cluster-a").isoformat(),
+        )
+        self.assertEqual(
+            shifter.shift_text("01/02/2020", "cluster-a", date_order="mdy"),
+            shifter.shift(original_mdy, "cluster-a").isoformat(),
+        )
 
     def test_unambiguous_numeric_dates_are_emitted_in_iso_format(self) -> None:
         shifter = DateShifter("date-secret")
@@ -110,8 +150,33 @@ class GeneralizationTests(unittest.TestCase):
         self.assertEqual(transformed["hospital"]["address"], "Example Hospital")
         self.assertEqual(transformed["hospital"]["village"], "Facility Locality")
 
+    def test_clinical_integrity_allows_date_only_redaction(self) -> None:
+        validator = ClinicalIntegrityValidator()
+        validator.validate(
+            {"diagnosis": "History noted 01/02/2020"},
+            {"diagnosis": "History noted [DATE REDACTED]"},
+        )
+        with self.assertRaises(ProcessingError) as raised:
+            validator.validate(
+                {"diagnosis": "common condition"},
+                {"diagnosis": "different condition"},
+            )
+        self.assertEqual(raised.exception.code, "clinical_integrity_failed")
+
 
 class RiskAssessmentTests(unittest.TestCase):
+    def test_indic_gender_and_birth_date_keys_are_included_in_risk_analysis(self) -> None:
+        profile = extract_quasi_identifiers(
+            {"ling": "female", "janmtithi": "2021-08-31"}
+        )
+        self.assertEqual(profile["gender"], "female")
+        self.assertEqual(profile["date"], "2021-08")
+
+        records = [{"ling": "female"}, {"ling": "male"}]
+        assessment = QuasiIdentifierRiskAnalyzer().assess(records, min_group_size=2)
+        suppressed = RareValueSuppressor().suppress(records, assessment)
+        self.assertEqual(suppressed, ({"ling": None}, {"ling": None}))
+
     def test_rare_quasi_identifier_is_suppressed_cohort_wide(self) -> None:
         records = [
             {
@@ -137,6 +202,65 @@ class RiskAssessmentTests(unittest.TestCase):
 
 
 class PrivacyTransformerTests(unittest.TestCase):
+    def test_transformer_uses_documented_source_date_order_only(self) -> None:
+        config = PipelineConfig(min_group_size=5)
+        transformer = PrivacyTransformer("privacy-secret", config)
+        inputs = []
+        for index in range(5):
+            record = _record(
+                index,
+                {"event_date": "01/02/2020", "diagnosis": "common condition"},
+            )
+            source = InputFileMetadata(
+                relative_path="registration/arogya_legacy_export.csv",
+                sha256=record.source.sha256,
+                size_bytes=record.source.size_bytes,
+            )
+            inputs.append(
+                PrivacyInput(
+                    NormalizedRecord(source, record.locator, record.fields),
+                    DetectionResult(identifier_count=0),
+                    LinkageDecision(LinkageAction.LINK, "shared-cluster"),
+                )
+            )
+
+        results = transformer.transform_batch(tuple(inputs))
+        expected = DateShifter("privacy-secret", config.date_shift_max_days).shift_text(
+            "01/02/2020", "shared-cluster", date_order="mdy"
+        )
+        self.assertTrue(
+            all(result.status is ProcessingStatus.SANITIZED for result in results)
+        )
+        self.assertTrue(
+            all(result.output_fields["event_date"] == expected for result in results)
+        )
+
+        unknown_results = transformer.transform_batch(
+            tuple(
+                PrivacyInput(
+                    _record(
+                        index + 10,
+                        {
+                            "event_date": "01/02/2020",
+                            "diagnosis": "common condition",
+                        },
+                    ),
+                    DetectionResult(identifier_count=0),
+                    LinkageDecision(LinkageAction.DO_NOT_LINK),
+                )
+                for index in range(5)
+            )
+        )
+        self.assertTrue(
+            all(result.status is ProcessingStatus.SANITIZED for result in unknown_results)
+        )
+        self.assertTrue(
+            all(
+                result.output_fields["event_date"] == "[DATE REDACTED]"
+                for result in unknown_results
+            )
+        )
+
     def test_cohort_transform_redacts_pii_and_preserves_clinical_values(self) -> None:
         transformer = PrivacyTransformer("privacy-secret", PipelineConfig(min_group_size=5))
         inputs = tuple(
