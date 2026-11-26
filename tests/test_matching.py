@@ -450,6 +450,184 @@ class IdentityMatcherTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             IdentityMatcher(self.registry, link_threshold=0)
 
+    def test_common_name_with_new_mrn_creates_indexes_and_links_followup(self) -> None:
+        first_patient = self._store(
+            "row:0",
+            _identity(
+                "row:0",
+                name="Asha Sharma",
+                dob=None,
+                phone=None,
+                hospital_id="HOSP-A-1",
+                hospital_id_namespace="hospital-a",
+            ),
+            namespace="hospital-a",
+        )
+        matcher_b = IdentityMatcher(self.registry, hospital_namespace="hospital-b")
+        incoming_b = _identity(
+            "row:1",
+            name="Asha Sharma",
+            dob=None,
+            phone=None,
+            hospital_id="HOSP-B-2",
+            hospital_id_namespace="hospital-b",
+        )
+
+        created = matcher_b.evaluate(incoming_b)
+        self.assertEqual(created.decision, IdentityDecision.CREATE)
+        self.assertEqual(created.reason, "no_matching_strong_candidate")
+
+        second_patient = self.registry.create_patient(_SOURCE_SHA, "row:1")
+        self.assertNotEqual(second_patient, first_patient)
+        self.registry.add_record_mapping(
+            _SOURCE_SHA, "row:1", second_patient, IdentityDecision.CREATE, created.confidence
+        )
+        self.registry.add_identity(
+            second_patient, _SOURCE_SHA, incoming_b, namespace="hospital-b"
+        )
+        self.assertEqual(
+            self.registry.find_candidates("hospital_identifier", "HOSP-B-2", "hospital-b"),
+            (second_patient,),
+        )
+
+        followup = matcher_b.evaluate(
+            _identity(
+                "row:2",
+                name="Asha Sharma",
+                dob=None,
+                phone=None,
+                hospital_id="HOSP-B-2",
+                hospital_id_namespace="hospital-b",
+            )
+        )
+        self.assertEqual(followup.decision, IdentityDecision.LINK)
+        self.assertEqual(followup.patient_id, second_patient)
+
+    def test_conflicting_mrn_same_namespace_with_shared_name_never_creates_or_links(self) -> None:
+        self._store(
+            "row:0",
+            _identity(
+                "row:0",
+                name="Asha Sharma",
+                dob=None,
+                phone=None,
+                hospital_id="HOSP-1",
+            ),
+        )
+
+        result = self.matcher.evaluate(
+            _identity(
+                "row:1",
+                name="Asha Sharma",
+                dob=None,
+                phone=None,
+                hospital_id="HOSP-9",
+            )
+        )
+        self.assertEqual(result.decision, IdentityDecision.UNRESOLVED)
+        self.assertEqual(result.reason, "hard_identifier_conflict")
+        self.assertIsNone(result.patient_id)
+
+    def test_multilingual_transliteration_variants_link_with_strong_identifier(self) -> None:
+        positive_cases = (
+            ("Sanjay Verma", "संजय वर्मा", "+919876543210", None),
+            ("Ram Singh", "राम सिंह", "+919876543211", None),
+            ("Anjali Gupta", "अंजलि गुप्ता", "+919876543212", None),
+            ("Geeta Chauhan", "Gita Chauhan", "+919876543213", None),
+            ("Pooja Sharma", "Puja Sharma", "+919876543214", None),
+            ("Priya Tiwari", "Prya Tivari", "+919876543215", None),
+            ("Tariq Khan", "Tarik Khan", "+919876543216", None),
+            ("Asha Sharma", "Sharma Asha", "+919876543217", None),
+            ("Asha Sharma Age 45 F Reg No 102", "Asha Sharma", None, "HOSP-77"),
+        )
+        for index, (stored_name, incoming_name, phone, mrn) in enumerate(positive_cases):
+            with self.subTest(stored=stored_name, incoming=incoming_name):
+                expected = self._store(
+                    f"pos:{index}:0",
+                    _identity(
+                        f"pos:{index}:0",
+                        name=stored_name,
+                        dob=None,
+                        phone=phone,
+                        hospital_id=mrn,
+                    ),
+                )
+                result = self.matcher.evaluate(
+                    _identity(
+                        f"pos:{index}:1",
+                        name=incoming_name,
+                        dob=None,
+                        phone=phone,
+                        hospital_id=mrn,
+                    )
+                )
+                self.assertEqual(result.decision, IdentityDecision.LINK)
+                self.assertEqual(result.patient_id, expected)
+
+    def test_hospital_id_with_partial_name_and_exact_dob_links(self) -> None:
+        expected = self._store(
+            "dob-hosp:0",
+            _identity(
+                "dob-hosp:0",
+                name="Shahid Khan",
+                dob="1982-04-13",
+                phone=None,
+                hospital_id="HOSP-55",
+            ),
+        )
+        result = self.matcher.evaluate(
+            _identity(
+                "dob-hosp:1",
+                name="Shahid",
+                dob="1982-04-13",
+                phone=None,
+                hospital_id="HOSP-55",
+            )
+        )
+        self.assertEqual(result.decision, IdentityDecision.LINK)
+        self.assertEqual(result.patient_id, expected)
+
+    def test_negative_identity_conflicts_stay_unresolved(self) -> None:
+        negative_cases = (
+            ("diff_names_same_phone", "Asha Sharma", "1982-04-13", "+919811111111", None,
+             "Rahul Verma", "1982-04-13", "+919811111111", None),
+            ("family_phone_asha_usha", "Asha Sharma", "1982-04-13", "+919811111112", None,
+             "Usha Sharma", "1982-04-13", "+919811111112", None),
+            ("family_phone_rajesh_rakesh", "Rajesh Kumar", "1982-04-13", "+919811111113", None,
+             "Rakesh Kumar", "1982-04-13", "+919811111113", None),
+            ("diff_dob_similar_name_same_phone", "Geeta Chauhan", "1982-04-13", "+919811111114", None,
+             "Gita Chauhan", "1990-01-01", "+919811111114", None),
+            ("transliterated_name_without_support", "Geeta Chauhan", None, None, None,
+             "Gita Chauhan", None, None, None),
+            ("similar_distinct_name_with_dob_only", "Rajesh Kumar", "1982-04-13", None, None,
+             "Rakesh Kumar", "1982-04-13", None, None),
+            ("different_mrn_same_namespace", "Asha Sharma", "1982-04-13", None, "HOSP-101",
+             "Asha Sharma", "1982-04-13", None, "HOSP-102"),
+        )
+        for label, s_name, s_dob, s_phone, s_mrn, c_name, c_dob, c_phone, c_mrn in negative_cases:
+            with self.subTest(case=label):
+                self._store(
+                    f"neg:{label}:0",
+                    _identity(
+                        f"neg:{label}:0",
+                        name=s_name,
+                        dob=s_dob,
+                        phone=s_phone,
+                        hospital_id=s_mrn,
+                    ),
+                )
+                result = self.matcher.evaluate(
+                    _identity(
+                        f"neg:{label}:1",
+                        name=c_name,
+                        dob=c_dob,
+                        phone=c_phone,
+                        hospital_id=c_mrn,
+                    )
+                )
+                self.assertEqual(result.decision, IdentityDecision.UNRESOLVED)
+                self.assertIsNone(result.patient_id)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 import math
+import re
 
 from lumen_ex.contracts.identity import IdentityDecision, IdentityValue, PatientIdentity
 from lumen_ex.contracts.models import LinkageAction, LinkageDecision, NormalizedRecord
@@ -29,6 +30,39 @@ _STRONG_IDENTIFIERS = frozenset(
         "email",
     }
 )
+_STRONG_EXACT_EVIDENCE = frozenset(f"{field}_exact" for field in _STRONG_IDENTIFIERS)
+_NAME_METADATA_BOUNDARIES = frozenset(
+    {
+        "age",
+        "umar",
+        "umr",
+        "umra",
+        "aayu",
+        "ayu",
+        "sex",
+        "dob",
+        "reg",
+        "regn",
+        "uhid",
+        "mrn",
+        "ipd",
+        "opd",
+        "ward",
+        "bed",
+        "mob",
+        "mobile",
+        "phone",
+        "ph",
+        "yrs",
+        "yr",
+        "year",
+        "years",
+        "saal",
+        "sal",
+        "varsh",
+    }
+)
+_AGE_OR_NUMERIC_TOKEN = re.compile(r"^\d+(?:[mf]|yrs?|y)?$")
 _MIN_NAME_CORROBORATION = 0.75
 _MIN_NAME_CONFLICT = 0.55
 _DEFAULT_LINK_THRESHOLD = 0.85
@@ -137,12 +171,12 @@ class IdentityMatcher:
                             "candidate_limit_exceeded",
                         )
 
+        has_hospital_namespace = bool(
+            identity.source_system
+            or self.hospital_namespace
+            or any(value.namespace for value in identity.hospital_identifier)
+        )
         if not candidates:
-            has_hospital_namespace = bool(
-                identity.source_system
-                or self.hospital_namespace
-                or any(value.namespace for value in identity.hospital_identifier)
-            )
             if _sufficient_for_create(values, has_hospital_namespace):
                 return IdentityMatchResult(
                     IdentityDecision.CREATE, None, 0.9, "no_existing_candidate"
@@ -170,17 +204,53 @@ class IdentityMatcher:
             for candidate in scores
             if not candidate.hard_conflict
             and "name_conflict" not in candidate.evidence
+            and "dob_conflict" not in candidate.evidence
             and candidate.confidence >= self.link_threshold
             and _has_independent_support(candidate.evidence)
         )
         if not eligible:
-            reason = (
-                "hard_identifier_conflict"
-                if all(candidate.hard_conflict for candidate in scores)
-                else "weak_candidate_evidence"
+            if any(candidate.hard_conflict for candidate in scores):
+                reason = (
+                    "hard_identifier_conflict"
+                    if all(candidate.hard_conflict for candidate in scores)
+                    else "weak_candidate_evidence"
+                )
+                return IdentityMatchResult(
+                    IdentityDecision.UNRESOLVED, None, scores[0].confidence, reason, scores
+                )
+            has_strong_or_supported_candidate = any(
+                (set(candidate.evidence) & _STRONG_EXACT_EVIDENCE)
+                or "independent_support" in candidate.evidence
+                for candidate in scores
             )
+            has_non_hospital_strong_id = any(
+                values[field_name]
+                for field_name in _STRONG_IDENTIFIERS - {"hospital_identifier"}
+            )
+            has_cross_namespace_hospital_overlap = bool(
+                not has_non_hospital_strong_id
+                and identity.hospital_identifier
+                and any(
+                    self._shares_hospital_identifier_value(
+                        candidate.patient_id, identity
+                    )
+                    for candidate in scores
+                )
+            )
+            if (
+                not has_strong_or_supported_candidate
+                and not has_cross_namespace_hospital_overlap
+                and _sufficient_for_create(values, has_hospital_namespace)
+            ):
+                return IdentityMatchResult(
+                    IdentityDecision.CREATE,
+                    None,
+                    0.9,
+                    "no_matching_strong_candidate",
+                    scores,
+                )
             return IdentityMatchResult(
-                IdentityDecision.UNRESOLVED, None, scores[0].confidence, reason, scores
+                IdentityDecision.UNRESOLVED, None, scores[0].confidence, "weak_candidate_evidence", scores
             )
         if (
             len(eligible) > 1
@@ -215,6 +285,7 @@ class IdentityMatcher:
         best_name_similarity = 0.0
         best_relative_similarity = 0.0
         has_stored_name = False
+        has_stored_dob = False
         for field_name, stored_value in self.registry.iter_identity_values(patient_id):
             normalized = stored_value.normalized
             if normalized is None:
@@ -234,6 +305,10 @@ class IdentityMatcher:
                         best_relative_similarity,
                         _name_similarity(current_name, stored_name),
                     )
+            elif field_name == "date_of_birth":
+                has_stored_dob = True
+                if normalized in values["date_of_birth"]:
+                    exact_fields.add("date_of_birth")
             elif (
                 field_name == "location"
                 and _is_village_source(stored_value.source_key)
@@ -273,6 +348,12 @@ class IdentityMatcher:
             evidence.add("name_conflict")
         if best_relative_similarity >= _MIN_NAME_CORROBORATION:
             evidence.add("relative_name_similar")
+        if (
+            values["date_of_birth"]
+            and has_stored_dob
+            and "date_of_birth" not in exact_fields
+        ):
+            evidence.add("dob_conflict")
 
         hard_conflict = False
         for identifier in identity.hospital_identifier:
@@ -308,6 +389,38 @@ class IdentityMatcher:
             evidence=tuple(sorted(evidence)),
             hard_conflict=hard_conflict,
         )
+
+    def _shares_hospital_identifier_value(
+        self, patient_id: str, identity: PatientIdentity
+    ) -> bool:
+        """Return whether an existing cluster holds an incoming MRN under a distinct explicit issuer."""
+        incoming_pairs = {
+            (
+                value.normalized,
+                _identifier_namespace(
+                    value, identity.source_system, self.hospital_namespace
+                ),
+            )
+            for value in identity.hospital_identifier
+            if isinstance(value.normalized, str) and value.normalized
+        }
+        if not incoming_pairs:
+            return False
+        for field_name, stored_value in self.registry.iter_identity_values(patient_id):
+            if field_name != "hospital_identifier" or not stored_value.normalized:
+                continue
+            stored_ns = stored_value.namespace or ""
+            for incoming_mrn, incoming_ns in incoming_pairs:
+                if (
+                    stored_value.normalized == incoming_mrn
+                    and stored_ns
+                    and incoming_ns
+                    and stored_ns != incoming_ns
+                    and not stored_ns.startswith("file:")
+                    and not incoming_ns.startswith("file:")
+                ):
+                    return True
+        return False
 
 
 def _normalized_values(identity: PatientIdentity) -> dict[str, set[str]]:
@@ -378,12 +491,118 @@ def _evidence_confidence(
     return min(1.0, max(0.0, 1.0 - confidence))
 
 
+def _clean_name_tokens(name: str) -> list[str]:
+    """Strip trailing demographic or registration suffixes from normalized names."""
+    tokens = name.split()
+    cleaned: list[str] = []
+    for index, token in enumerate(tokens):
+        if index >= 1 and (
+            token in _NAME_METADATA_BOUNDARIES
+            or _AGE_OR_NUMERIC_TOKEN.fullmatch(token) is not None
+        ):
+            break
+        cleaned.append(token)
+    return cleaned or tokens
+
+
+def _vowel_folded_token(token: str) -> str:
+    """Fold Roman/ITRANS vowel-length, anusvara, and consonant-equivalent variants."""
+    folded = token.replace("ngh", "nh")
+    folded = re.sub(r"m(?=[bcdfghjklmnpqrstvwxyz])", "n", folded)
+    folded = (
+        folded.replace("q", "k")
+        .replace("w", "v")
+        .replace("ph", "f")
+        .replace("z", "j")
+        .replace("chh", "ch")
+        .replace("ee", "i")
+        .replace("oo", "u")
+        .replace("aa", "a")
+        .replace("ai", "e")
+        .replace("au", "o")
+    )
+    if len(folded) > 1:
+        folded = folded[0] + folded[1:].replace("y", "i")
+    return re.sub(r"(.)\1+", r"\1", folded)
+
+
+def _phonetic_skeleton(token: str) -> str:
+    """Return a leading-vowel + consonant skeleton preserving core consonant identity."""
+    if not token:
+        return ""
+    leading = token[0] if token[0] in "aeiou" else ""
+    if leading in {"e", "i"}:
+        leading = "i"
+    elif leading in {"o", "u"}:
+        leading = "u"
+    folded = _vowel_folded_token(token)
+    folded = re.sub(r"([bcdfghjklmnpqrstvwxyz])h", r"\1", folded)
+    consonants = "".join(ch for ch in folded if ch not in "aeiou")
+    consonants = re.sub(r"(.)\1+", r"\1", consonants)
+    return leading + consonants
+
+
+def _token_similarity(first: str, second: str) -> float:
+    """Score two normalized name tokens while guarding against distinct-name collisions."""
+    if first == second:
+        return 1.0
+    if _vowel_folded_token(first) == _vowel_folded_token(second):
+        return 0.92
+    skeleton_a, skeleton_b = _phonetic_skeleton(first), _phonetic_skeleton(second)
+    char_ratio = SequenceMatcher(None, first, second, autojunk=False).ratio()
+    if skeleton_a and skeleton_a == skeleton_b:
+        return max(0.85, min(0.92, char_ratio))
+    skeleton_ratio = (
+        SequenceMatcher(None, skeleton_a, skeleton_b, autojunk=False).ratio()
+        if (skeleton_a and skeleton_b)
+        else 0.0
+    )
+    if skeleton_ratio >= 0.80 and char_ratio >= 0.78:
+        return char_ratio * 0.90
+    if char_ratio >= 0.85 and len(first) >= 4 and len(second) >= 4 and first[0] == second[0]:
+        return char_ratio * 0.75
+    return 0.0
+
+
 def _name_similarity(first: str, second: str) -> float:
+    """Compare normalized names across transliteration, token order, and trailing metadata."""
     if first == second:
         return 1.0
     if len(first) > 512 or len(second) > 512:
         return 0.0
-    return SequenceMatcher(None, first.split(), second.split(), autojunk=False).ratio()
+    tokens_a = _clean_name_tokens(first)
+    tokens_b = _clean_name_tokens(second)
+    if not tokens_a or not tokens_b:
+        return 0.0
+    if tokens_a == tokens_b:
+        return 1.0
+
+    len_a, len_b = len(tokens_a), len(tokens_b)
+    dp = [[0.0] * (len_b + 1) for _ in range(len_a + 1)]
+    pair_scores: list[tuple[float, int, int]] = []
+    for i, token_a in enumerate(tokens_a):
+        for j, token_b in enumerate(tokens_b):
+            score = _token_similarity(token_a, token_b)
+            dp[i + 1][j + 1] = max(
+                dp[i][j + 1],
+                dp[i + 1][j],
+                dp[i][j] + score,
+            )
+            if score > 0.0:
+                pair_scores.append((score, i, j))
+    ordered = (2.0 * dp[len_a][len_b]) / (len_a + len_b)
+
+    pair_scores.sort(reverse=True)
+    used_a: set[int] = set()
+    used_b: set[int] = set()
+    unordered_sum = 0.0
+    for score, i, j in pair_scores:
+        if i not in used_a and j not in used_b:
+            used_a.add(i)
+            used_b.add(j)
+            unordered_sum += score
+    unordered = (2.0 * unordered_sum) / (len_a + len_b)
+    return max(ordered, unordered * 0.85)
 
 
 def _has_independent_support(evidence: tuple[str, ...]) -> bool:
@@ -396,8 +615,6 @@ def _has_independent_support(evidence: tuple[str, ...]) -> bool:
     name_support = "name_similar" in evidence_set
     if strong_identifier:
         return True
-    if "hospital_identifier_exact" in evidence_set and name_support:
-        return True
     has_second_clue = bool(
         evidence_set
         & {
@@ -406,6 +623,8 @@ def _has_independent_support(evidence: tuple[str, ...]) -> bool:
             "relative_name_similar",
         }
     )
+    if "hospital_identifier_exact" in evidence_set and (name_support or has_second_clue):
+        return True
     village_age = (
         "village_exact" in evidence_set
         and bool(evidence_set & {"age_exact", "age_near"})
