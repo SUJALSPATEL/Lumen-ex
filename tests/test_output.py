@@ -26,6 +26,50 @@ from lumen_ex.identity import PatientIdentityNormalizer
 
 
 class SanitizedOutputWriterTests(unittest.TestCase):
+    def test_release_preserves_lab_columns_and_clinical_note_phrases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, output = root / "input", root / "output"
+            source.mkdir()
+            labs = "test,result,unit\n" + "Random Blood Sugar,142,mg/dL\n" * 5
+            (source / "results.csv").write_text(labs, encoding="utf-8")
+            observations = [
+                {
+                    "test": "Serum Sodium", "value": 135, "unit": "mmol/L",
+                    "history": history,
+                }
+                for history in ("K/C/O HTN on treatment", "K/C/O DM2 x 6 yrs")
+                for _ in range(3)
+            ]
+            (source / "results.json").write_text(
+                json.dumps({"results": observations}), encoding="utf-8"
+            )
+            note_lines = (
+                "K/C/O: J45.9\n"
+                "Continue Amlodipine 5 mg 0-0-1 orally.\n"
+                "Inh Salbutamol inhaler 100 mcg 2 puffs.\n"
+                "Serum Creatinine 1.4 mg/dL | Platelet Count 200000 /uL\n"
+                "BP 120/80\n"
+            )
+            for index in range(5):
+                (source / f"note_{index}.txt").write_text(
+                    note_lines + "Phone: 9876543210\n", encoding="utf-8"
+                )
+            report = ReleasePipeline(
+                source, output, PipelineConfig(), "test-secret", SensitiveDataLeakScanner()
+            ).run()
+            self.assertEqual(report.records_processed, 16)
+            for entry in report.files:
+                self.assertIsNotNone(entry.output)
+                payload = (output / entry.output).read_text(encoding="utf-8")
+                if entry.output.endswith(".csv"):
+                    self.assertEqual(payload, labs)
+                elif entry.output.endswith(".json"):
+                    self.assertEqual(json.loads(payload)["results"], observations)
+                else:
+                    self.assertIn(note_lines, payload)
+                    self.assertNotIn("9876543210", payload)
+
     def test_path_tokens_preserve_prefixes_and_distinguish_identical_files(self) -> None:
         left = _metadata("private/ward/a.csv", b"same")
         right = _metadata("private/ward/b.csv", b"same")

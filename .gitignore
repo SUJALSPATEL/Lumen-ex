@@ -8,3 +8,5 @@ __pycache__/
 *.pstats
 .DS_Store
 .aider*
+practice_test/
+output_r02/

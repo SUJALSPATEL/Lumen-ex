@@ -151,6 +151,23 @@ class GeneralizationTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "clinical_integrity_failed")
 
+    def test_stay_validation_uses_the_same_configured_date_order_as_shifting(self) -> None:
+        validator = ClinicalIntegrityValidator()
+        original = {"admission_date": "04/05/2020", "discharge_date": "07/05/2020"}
+        shifter = DateShifter("date-secret")
+        shifted = {
+            key: shifter.shift_text(value, "cluster", date_order="dmy")
+            for key, value in original.items()
+        }
+        validator.validate(original, shifted, date_order="dmy")
+        self.assertEqual(
+            (date_from_iso(shifted["discharge_date"]) - date_from_iso(shifted["admission_date"])).days,
+            3,
+        )
+        shifted["discharge_date"] = shifted["admission_date"]
+        with self.assertRaisesRegex(ProcessingError, "clinical_integrity_failed"):
+            validator.validate(original, shifted, date_order="dmy")
+
 
 class RiskAssessmentTests(unittest.TestCase):
     def test_indic_gender_and_birth_date_keys_are_included_in_risk_analysis(self) -> None:

@@ -19,6 +19,30 @@ class MultilingualPIIDetectorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.detector = MultilingualPIIDetector()
 
+    def test_clinical_phrases_do_not_override_identity_evidence(self) -> None:
+        record = NormalizedRecord(
+            source=_source("notes/clinical.txt", InputFormat.TEXT),
+            locator="doc",
+            fields={
+                "patient_name": "Random Blood Sugar",
+                "test": "Person Example",
+                "text": (
+                    "Patient name: Serum Sodium\n"
+                    "K/C/O: Priya Kapoor\n"
+                    "Phone: 9876543210\n"
+                    "C/O: Arun Shah\n"
+                    "Aadhaar: 150000-410000\n"
+                    "Serum Sodium 135 mmol/L"
+                ),
+            },
+        )
+        findings = self.detector.detect(record).findings
+        for value in (
+            "Random Blood Sugar", "Person Example", "Serum Sodium", "Priya Kapoor",
+            "9876543210", "Arun Shah", "150000-410000",
+        ):
+            self.assertIn(value, {finding.value for finding in findings})
+
     def test_detects_structured_patient_fields_and_identifier_types(self) -> None:
         source = _source("registration/patient.csv", InputFormat.CSV)
         normalized = PatientIdentityNormalizer().normalize(

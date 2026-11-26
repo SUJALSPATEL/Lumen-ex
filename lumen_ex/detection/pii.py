@@ -246,6 +246,37 @@ _HONORIFIC_NAME = re.compile(
 _PROPER_NAME_SEQUENCE = re.compile(
     r"(?<![\w])(?P<name>[A-Z][a-z]{1,}(?:[ '-][A-Z][a-z]{1,}){1,2})(?![\w])"
 )
+_CLINICAL_HISTORY = re.compile(
+    r"K[ \t]*/[ \t]*C[ \t]*/[ \t]*O"
+    r"(?:[ \t]*:[ \t]*[A-Z][0-9]{2}(?:\.[A-Z0-9]{1,4})?"
+    r"|[ \t]+(?:HTN[ \t]+on[ \t]+treatment|DM2[ \t]+x[ \t]+[0-9]{1,3}[ \t]+yrs?))"
+    r'[ \t]*(?=\r?$|")',
+    re.IGNORECASE | re.MULTILINE,
+)
+_JSON_HISTORY_PREFIX = re.compile(r'"history"[ \t]*:[ \t]*"$', re.IGNORECASE)
+_LAB_TEST_TERMS = frozenset({
+    "haemoglobin", "hemoglobin", "platelet count", "random blood sugar",
+    "serum creatinine", "serum sodium", "total wbc count",
+})
+_LAB_TEST_KEYS = {"test", "labtest", "testname"}
+_JSON_LAB_TEST_PREFIX = re.compile(
+    r'"(?:test|lab[ _]?test|test[ _]?name)"[ \t]*:[ \t]*"$', re.IGNORECASE
+)
+_LAB_UNITS = r"(?:mg/dL|g/dL|mmol/L|mIU/L|/uL|/µL|%)"
+_LAB_MEASUREMENT_SUFFIX = re.compile(
+    rf"(?:[ \t]+[0-9]+(?:\.[0-9]+)?[ \t]*{_LAB_UNITS}(?=[ \t|,;\r\n]|$)"
+    rf"|[,\t](?:[0-9]+(?:\.[0-9]+)?|[0-9]{{1,7}}-[0-9])[,\t]{_LAB_UNITS}(?=[,\t\r\n]|$))",
+    re.IGNORECASE,
+)
+_MEDICATION_PHRASE = re.compile(
+    r"(?:continue[ \t]+)?(?:amlodipine|levothyroxine)"
+    r"|(?:inh[ \t]+)?salbutamol(?:[ \t]+inhaler)?",
+    re.IGNORECASE,
+)
+_MEDICATION_DOSE_SUFFIX = re.compile(
+    r"(?:[ \t]+inhaler)?[ \t]+[0-9]{1,4}(?:\.[0-9]+)?[ \t]*(?:mg|mcg|µg)\b",
+    re.IGNORECASE,
+)
 _NAME_LABELS = (
     "patient full name",
     "patient name",
@@ -655,7 +686,11 @@ class MultilingualPIIDetector:
         if not _is_non_patient_context(context):
             for match in _RELATIVE_NAME.finditer(text):
                 candidate = match.group("name").strip()
-                if _is_clinical_name(candidate) or _is_generic_name(candidate):
+                if (
+                    _is_clinical_history(text, match.start())
+                    or _is_clinical_name(candidate)
+                    or _is_generic_name(candidate)
+                ):
                     continue
                 self._add_match(
                     DetectionEntityType.RELATIVE_NAME,
@@ -707,6 +742,9 @@ class MultilingualPIIDetector:
                         _is_clinician_context(text, match.start("name"))
                         or _is_clinical_name(candidate)
                         or _is_generic_name(candidate)
+                        or _is_clinical_phrase(
+                            text, match.start("name"), match.end("name"), context
+                        )
                         or _compact_key(candidate)
                         in {"patientname", "patientfullname", "fullname"}
                     ):
@@ -1012,6 +1050,34 @@ def _is_clinical_name(value: str) -> bool:
         _compact_key(value[start:end]) in _COMPLAINT_OR_CLINICAL_TERMS
         for start, end in _token_spans(value)
     )
+
+
+def _is_clinical_phrase(
+    text: str, start: int, end: int, context: tuple[str, ...]
+) -> bool:
+    candidate = text[start:end]
+    if candidate.casefold() in _LAB_TEST_TERMS:
+        if context and _compact_key(context[-1]) in _LAB_TEST_KEYS:
+            return text.strip() == candidate
+        if text.startswith('"', end) and _JSON_LAB_TEST_PREFIX.search(
+            text, max(0, start - 64), start
+        ):
+            return True
+        if _LAB_MEASUREMENT_SUFFIX.match(text, end):
+            return start == 0 or text[start - 1] in " \t,|\n"
+    return bool(
+        _MEDICATION_PHRASE.fullmatch(candidate)
+        and _MEDICATION_DOSE_SUFFIX.match(text, end)
+    )
+
+
+def _is_clinical_history(text: str, start: int) -> bool:
+    match = _CLINICAL_HISTORY.match(text, start)
+    if match is None:
+        return False
+    if text.startswith('"', match.end()):
+        return bool(_JSON_HISTORY_PREFIX.search(text, max(0, start - 64), start))
+    return start == 0 or text[start - 1] == "\n"
 
 
 def _is_generic_name(value: str) -> bool:

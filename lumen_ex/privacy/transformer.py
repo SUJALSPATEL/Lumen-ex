@@ -191,20 +191,19 @@ class PrivacyTransformer:
             raise ProcessingError("privacy_patient_reference_invalid")
 
         generalized_fields = self._location_generalizer.generalize(original_fields)
+        date_order = self.config.date_order_for_source(record.source.relative_path)
         transformed_fields = self._transform_tree(
             generalized_fields,
             path=(),
             findings=item.detection.findings,
             patient_reference=patient_reference,
-            date_order=self.config.date_order_for_source(
-                record.source.relative_path
-            ),
+            date_order=date_order,
             depth=0,
         )
         if not isinstance(transformed_fields, dict):
             raise ProcessingError("invalid_record")
         fields = transformed_fields
-        self._integrity_validator.validate(original_fields, fields)
+        self._integrity_validator.validate(original_fields, fields, date_order=date_order)
 
         structure = self._safe_structure(record, item.detection.findings)
         _verify_findings_removed(item.detection.findings, fields, structure)
