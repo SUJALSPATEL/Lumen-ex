@@ -40,18 +40,6 @@ class PseudonymizationTests(unittest.TestCase):
         )
         self.assertNotIn("patient-cluster", repr(first))
 
-    def test_source_tokens_are_stable_secret_scoped_and_opaque(self) -> None:
-        source = "urn:clinic:private-west"
-        first = Pseudonymizer("first-secret")
-        same_secret = Pseudonymizer("first-secret")
-        other_secret = Pseudonymizer("second-secret")
-
-        token = first.source_token(source)
-        self.assertEqual(token, same_secret.source_token(source))
-        self.assertNotEqual(token, other_secret.source_token(source))
-        self.assertEqual(len(token), 20)
-        self.assertNotIn(source, token)
-
 
 class DateTransformationTests(unittest.TestCase):
     def test_patient_date_shift_is_deterministic_and_preserves_intervals(self) -> None:
@@ -317,7 +305,7 @@ class PrivacyTransformerTests(unittest.TestCase):
         self.assertEqual(len(pseudonyms), 1)
         self.assertTrue(all(result.risk_assessment.records_assessed == 5 for result in results))
 
-    def test_pii_in_header_and_filename_are_removed_from_output_metadata(self) -> None:
+    def test_pii_in_header_is_redacted_and_release_path_is_deferred(self) -> None:
         transformer = PrivacyTransformer("privacy-secret", PipelineConfig(min_group_size=5))
         items = []
         for index in range(5):
@@ -364,8 +352,7 @@ class PrivacyTransformerTests(unittest.TestCase):
         results = transformer.transform_batch(tuple(items))
         self.assertTrue(all(result.status is ProcessingStatus.SANITIZED for result in results))
         self.assertTrue(all(result.output_structure["headers"][0] == "[REDACTED]" for result in results))
-        self.assertTrue(all("Asha" not in result.output_relative_path for result in results))
-        self.assertTrue(all("/file_" in result.output_relative_path for result in results))
+        self.assertTrue(all(result.output_relative_path is None for result in results))
 
     def test_unresolved_records_do_not_receive_a_patient_pseudonym(self) -> None:
         transformer = PrivacyTransformer("privacy-secret")

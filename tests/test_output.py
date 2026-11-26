@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from lumen_ex.config import PipelineConfig
+from lumen_ex.errors import ProcessingError
 from lumen_ex.contracts.models import (
     InputFileMetadata,
     InputFormat,
@@ -25,6 +26,36 @@ from lumen_ex.identity import PatientIdentityNormalizer
 
 
 class SanitizedOutputWriterTests(unittest.TestCase):
+    def test_path_tokens_preserve_prefixes_and_distinguish_identical_files(self) -> None:
+        left = _metadata("private/ward/a.csv", b"same")
+        right = _metadata("private/ward/b.csv", b"same")
+        sibling = _metadata("private/other/a.csv", b"same")
+        writer = SanitizedOutputWriter(
+            Path("."), Path("."), SensitiveDataLeakScanner(), secret="test-secret"
+        )
+        paths = [writer._output_path(source).split("/") for source in (left, right, sibling)]
+        self.assertEqual(paths[0][:-1], paths[1][:-1])
+        self.assertEqual(paths[0][:2], paths[2][:2])
+        self.assertNotEqual(paths[0][2], paths[2][2])
+        self.assertEqual(len({tuple(path) for path in paths}), 3)
+        with self.assertRaisesRegex(ProcessingError, "filesystem_error"):
+            writer._output_path(left)
+
+    def test_only_detected_format_controls_the_extension(self) -> None:
+        writer = SanitizedOutputWriter(
+            Path("."), Path("."), SensitiveDataLeakScanner(), secret="test-secret"
+        )
+        raw_hash = hashlib.sha256(b"").hexdigest()
+        source = InputFileMetadata(
+            "private.patient-id", raw_hash, 0, detected_format=InputFormat.JSON
+        )
+        self.assertRegex(writer._output_path(source), r"^sanitized/f_[a-z]{32}\.json$")
+        unsupported = InputFileMetadata(
+            "private.patient-id", raw_hash, 0, detected_format=InputFormat.UNSUPPORTED
+        )
+        with self.assertRaisesRegex(ProcessingError, "unsupported_format"):
+            writer._output_path(unsupported)
+
     def test_csv_keeps_header_and_places_pseudonym_in_existing_identifier_field(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -62,7 +93,7 @@ class SanitizedOutputWriterTests(unittest.TestCase):
                 patient_pseudonym="PSN-0123456789ABCDEF",
             )
             writer = SanitizedOutputWriter(
-                input_root, output_root, SensitiveDataLeakScanner()
+                input_root, output_root, SensitiveDataLeakScanner(), secret="test-secret"
             )
 
             written = writer.write_file(
@@ -75,7 +106,7 @@ class SanitizedOutputWriterTests(unittest.TestCase):
                 written.manifest.reason,
             )
             self.assertEqual(written.records[0]["patient"], "PSN-0123456789ABCDEF")
-            with (output_root / "sanitized" / "records.csv").open(
+            with (output_root / written.manifest.output).open(
                 encoding="utf-8", newline=""
             ) as stream:
                 rows = list(csv.reader(stream))
@@ -125,7 +156,7 @@ class SanitizedOutputWriterTests(unittest.TestCase):
                 generalized=True,
             )
             writer = SanitizedOutputWriter(
-                input_root, output_root, SensitiveDataLeakScanner()
+                input_root, output_root, SensitiveDataLeakScanner(), secret="test-secret"
             )
 
             written = writer.write_file(
@@ -142,13 +173,13 @@ class SanitizedOutputWriterTests(unittest.TestCase):
             self.assertEqual(written.records[0]["loc"], "/visits/2")
             self.assertEqual(written.records[0]["out"], "/visits/0")
             self.assertEqual(
-                json.loads((output_root / "sanitized" / "visits.json").read_text())[
+                json.loads((output_root / written.manifest.output).read_text())[
                     "visits"
                 ],
                 [{"diagnosis": "stable"}],
             )
             self.assertEqual((input_root / "visits.json").read_bytes(), raw)
-            sanitized = (output_root / "sanitized/visits.json").read_text(encoding="utf-8")
+            sanitized = (output_root / written.manifest.output).read_text(encoding="utf-8")
             self.assertEqual(json.loads(sanitized)["_export_meta"]["source_path"], "[REDACTED]")
             self.assertNotIn("synthetic_marker_854", sanitized)
 
@@ -202,7 +233,7 @@ class SanitizedOutputWriterTests(unittest.TestCase):
                 patient_pseudonym="PSN-0123456789ABCDEF",
             )
             writer = SanitizedOutputWriter(
-                input_root, output_root, SensitiveDataLeakScanner()
+                input_root, output_root, SensitiveDataLeakScanner(), secret="test-secret"
             )
 
             written = writer.write_file(
@@ -216,7 +247,7 @@ class SanitizedOutputWriterTests(unittest.TestCase):
             )
             self.assertEqual(written.records[0]["patient"], "PSN-0123456789ABCDEF")
             output_document = json.loads(
-                (output_root / "sanitized" / "bundle.json").read_text(
+                (output_root / written.manifest.output).read_text(
                     encoding="utf-8"
                 )
             )
@@ -258,12 +289,12 @@ class SanitizedOutputWriterTests(unittest.TestCase):
             )
 
             written = SanitizedOutputWriter(
-                input_root, output_root, SensitiveDataLeakScanner()
+                input_root, output_root, SensitiveDataLeakScanner(), secret="test-secret"
             ).write_file(source, [ReleaseRecord(parsed, normalized, result)])
 
             self.assertEqual(written.manifest.status, ProcessingStatus.QUARANTINED)
             self.assertEqual(written.manifest.reason, "format_mismatch")
-            self.assertFalse((output_root / "sanitized" / "duplicate.csv").exists())
+            self.assertEqual(list((output_root / "sanitized").iterdir()), [])
 
     def test_quarantined_csv_row_is_omitted_without_discarding_safe_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -305,7 +336,7 @@ class SanitizedOutputWriterTests(unittest.TestCase):
             )
 
             written = SanitizedOutputWriter(
-                input_root, output_root, SensitiveDataLeakScanner()
+                input_root, output_root, SensitiveDataLeakScanner(), secret="test-secret"
             ).write_file(
                 source,
                 (
@@ -365,11 +396,11 @@ class SanitizedOutputWriterTests(unittest.TestCase):
             scanner = SensitiveDataLeakScanner(canaries=("Mina Rao",))
 
             written = SanitizedOutputWriter(
-                input_root, output_root, scanner
+                input_root, output_root, scanner, secret="test-secret"
             ).write_file(source, records)
 
             self.assertEqual(written.manifest.status, ProcessingStatus.SANITIZED)
-            output = (output_root / "sanitized" / "headers.csv").read_text(
+            output = (output_root / written.manifest.output).read_text(
                 encoding="utf-8"
             )
             self.assertNotIn("Mina Rao", output)
@@ -411,13 +442,13 @@ class SanitizedOutputWriterTests(unittest.TestCase):
             )
 
             written = SanitizedOutputWriter(
-                input_root, output_root, SensitiveDataLeakScanner()
+                input_root, output_root, SensitiveDataLeakScanner(), secret="test-secret"
             ).write_file(
                 source, [ReleaseRecord(parsed, normalized, result)]
             )
 
             self.assertEqual(written.manifest.status, ProcessingStatus.SANITIZED)
-            with (output_root / "sanitized" / "header.csv").open(
+            with (output_root / written.manifest.output).open(
                 encoding="utf-8", newline=""
             ) as stream:
                 rows = list(csv.reader(stream))
@@ -435,18 +466,18 @@ class SanitizedOutputWriterTests(unittest.TestCase):
                 rows.append(
                     f"Patient {index},987654321{index},40,hypertension"
                 )
-            (input_root / "cohort.csv").write_text(
+            source_path = "\u0930\u094b\u0917\u0940-9876543210/ward-private/\u0938\u0940\u092e\u093e-MRN-41882.CSV"
+            source_file = input_root / source_path
+            source_file.parent.mkdir(parents=True)
+            source_file.write_text(
                 "\n".join(rows) + "\n", encoding="utf-8"
             )
             scanner = SensitiveDataLeakScanner(canaries=("test-secret",))
 
-            report = ReleasePipeline(
-                input_root,
-                output_root,
-                PipelineConfig(),
-                "test-secret",
-                scanner,
-            ).run()
+            with self.assertLogs("lumen_ex", level="INFO") as logs:
+                report = ReleasePipeline(
+                    input_root, output_root, PipelineConfig(), "test-secret", scanner
+                ).run()
 
             report_data = json.loads(
                 (output_root / "report.json").read_text(encoding="utf-8")
@@ -463,8 +494,14 @@ class SanitizedOutputWriterTests(unittest.TestCase):
             output_name = records[0]["file"]
             self.assertRegex(
                 output_name,
-                r"sanitized/src_[0-9a-f]{20}/cohort\.csv",
+                r"^sanitized/(?:d_[a-z]{32}/){2}f_[a-z]{32}\.csv$",
             )
+            self.assertEqual(report_data["files"][0]["output"], output_name)
+            self.assertTrue((output_root / output_name).is_file())
+            for component in source_path.split("/"):
+                self.assertNotIn(component, json.dumps(report_data, ensure_ascii=False))
+                self.assertNotIn(component, "\n".join(record_lines + logs.output))
+            self.assertEqual(source_file.read_text(encoding="utf-8"), "\n".join(rows) + "\n")
             self.assertTrue(all(record["file"] == output_name for record in records))
             OutputContractValidator().validate(
                 output_root, report.files, records, report_data
@@ -502,7 +539,7 @@ class SanitizedOutputWriterTests(unittest.TestCase):
             self.assertNotEqual(third_records[0]["file"], output_name)
             self.assertRegex(
                 third_records[0]["file"],
-                r"sanitized/src_[0-9a-f]{20}/cohort\.csv",
+                r"^sanitized/(?:d_[a-z]{32}/){2}f_[a-z]{32}\.csv$",
             )
 
     def test_release_pipeline_preserves_high_precision_json_numbers(self) -> None:
@@ -597,6 +634,7 @@ def _metadata(relative_path: str, raw: bytes) -> InputFileMetadata:
         relative_path=relative_path,
         sha256=hashlib.sha256(raw).hexdigest(),
         size_bytes=len(raw),
+        detected_format=InputFormat.JSON if relative_path.endswith(".json") else InputFormat.CSV,
         encoding="utf-8",
     )
 

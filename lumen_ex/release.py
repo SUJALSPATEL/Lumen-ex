@@ -84,7 +84,7 @@ class ReleasePipeline:
                 records_by_file[record.parsed.source.relative_path].append(record)
 
             writer = SanitizedOutputWriter(
-                self.input_root, self.output_root, self.leak_scanner
+                self.input_root, self.output_root, self.leak_scanner, secret=self.secret
             )
             file_results: list[FileWriteResult] = []
             report_files: list[OutputManifestEntry] = []
@@ -284,7 +284,6 @@ class ReleasePipeline:
                         normalized,
                         detection,
                         linkage,
-                        source_namespace=namespace,
                     )
                 )
                 prepared.append(

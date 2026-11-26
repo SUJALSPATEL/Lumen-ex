@@ -2,10 +2,9 @@
 
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
 import math
-from pathlib import PurePosixPath
 import re
 
 from lumen_ex.config import PipelineConfig
@@ -69,7 +68,6 @@ class PrivacyInput:
     record: NormalizedRecord
     detection: DetectionResult
     linkage: LinkageDecision
-    source_namespace: str | None = field(default=None, repr=False)
 
 
 class PrivacyTransformer:
@@ -209,25 +207,13 @@ class PrivacyTransformer:
         self._integrity_validator.validate(original_fields, fields)
 
         structure = self._safe_structure(record, item.detection.findings)
-        source_namespace = item.source_namespace or f"file:{record.source.sha256}"
-        output_relative_path = self._output_relative_path(
-            record,
-            item.detection.findings,
-            source_namespace,
-        )
-        _verify_findings_removed(
-            item.detection.findings,
-            fields,
-            structure,
-            output_relative_path,
-        )
+        _verify_findings_removed(item.detection.findings, fields, structure)
         pseudonym = self._pseudonymizer.for_decision(item.linkage)
         return SanitizationResult(
             status=ProcessingStatus.SANITIZED,
             locator=record.locator,
             output_fields=fields,
             output_structure=structure,
-            output_relative_path=output_relative_path,
             patient_pseudonym=pseudonym,
             identifiers_detected=item.detection.identifier_count,
             generalized=True,
@@ -356,24 +342,6 @@ class PrivacyTransformer:
             )
         return {"headers": output_headers}
 
-    def _output_relative_path(
-        self,
-        record: NormalizedRecord,
-        findings: Sequence[DetectionFinding],
-        source_namespace: str,
-    ) -> str:
-        source_path = PurePosixPath(record.source.relative_path.replace("\\", "/"))
-        source_directory = (
-            f"sanitized/src_{self._pseudonymizer.source_token(source_namespace)}"
-        )
-        if not any(finding.channel is DetectionChannel.FILENAME for finding in findings):
-            return f"{source_directory}/{source_path}"
-        suffix = source_path.suffix.casefold()
-        if suffix not in {".csv", ".tsv", ".txt", ".json"}:
-            suffix = ".dat"
-        token = self._pseudonymizer.filename_token(record.source.sha256)
-        return f"{source_directory}/file_{token}{suffix}"
-
 
 def _rewrite_text(
     text: str,
@@ -441,7 +409,6 @@ def _verify_findings_removed(
     findings: Sequence[DetectionFinding],
     fields: Mapping[str, object],
     structure: Mapping[str, object],
-    output_relative_path: str,
 ) -> None:
     sensitive_values = tuple(
         finding.value
@@ -452,7 +419,6 @@ def _verify_findings_removed(
         if (
             _contains_text(fields, sensitive_value)
             or _contains_text(structure, sensitive_value)
-            or sensitive_value in output_relative_path
         ):
             raise ProcessingError("invalid_record")
 

@@ -5,9 +5,10 @@ import csv
 from dataclasses import dataclass, field
 from decimal import Decimal
 import hashlib
+import hmac
 import io
 import json
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 from typing import Mapping, Sequence
 
@@ -24,6 +25,16 @@ from lumen_ex.errors import ProcessingError, SAFE_ERROR_CODES
 from lumen_ex.ingestion import validate_fhir_document
 from lumen_ex.security import SensitiveDataLeakScanner
 
+
+_OUTPUT_EXTENSIONS = {
+    InputFormat.CSV: ".csv",
+    InputFormat.TSV: ".tsv",
+    InputFormat.JSON: ".json",
+    InputFormat.FHIR: ".json",
+    InputFormat.TEXT: ".txt",
+}
+# Keep token bytes out of the scanner's numeric-identifier patterns.
+_PATH_TOKEN_ALPHABET = str.maketrans("0123456789", "qrstuvwxyz")
 
 _SAFE_HEADER_NAMES = {
     "name",
@@ -130,11 +141,17 @@ class SanitizedOutputWriter:
         input_root: Path,
         output_root: Path,
         leak_scanner: SensitiveDataLeakScanner,
+        *,
+        secret: str | bytes,
     ) -> None:
         self.input_root = input_root
         self.output_root = output_root
         self._scanner = leak_scanner
+        if not isinstance(secret, (str, bytes)) or not secret:
+            raise ProcessingError("secret_missing")
+        self._path_key = secret.encode("utf-8") if isinstance(secret, str) else secret
         self._claimed_paths: set[str] = set()
+        self._directory_prefixes: dict[str, bytes] = {}
 
     def write_file(
         self,
@@ -168,7 +185,7 @@ class SanitizedOutputWriter:
             )
 
         try:
-            output_path = self._output_path(source, records)
+            output_path = self._output_path(source)
             content, entries = self._serialize(source, records, output_path)
             if not self._scanner.scan_artifact_text(
                 content,
@@ -215,40 +232,36 @@ class SanitizedOutputWriter:
             records_quarantined=len(quarantined),
         )
 
-    def _output_path(
-        self, source: InputFileMetadata, records: Sequence[ReleaseRecord]
-    ) -> str:
-        paths = {
-            item.result.output_relative_path
-            for item in records
-            if item.result.output_relative_path is not None
-        }
-        if len(paths) > 1:
-            source_path = "sanitized/" + source.relative_path.replace("\\", "/")
-            explicit_paths = {path for path in paths if path != source_path}
-            if len(explicit_paths) != 1:
-                raise ProcessingError("invalid_record")
-            candidate = next(iter(explicit_paths))
-        elif paths:
-            candidate = next(iter(paths))
-        else:
-            candidate = "sanitized/" + source.relative_path.replace("\\", "/")
-        if not _safe_output_path(candidate):
-            raise ProcessingError("invalid_record")
-        if candidate in self._claimed_paths:
-            path = PurePosixPath(candidate)
-            relative_digest = hashlib.sha256(
-                source.relative_path.encode("utf-8")
-            ).hexdigest()[:10]
-            candidate = str(
-                path.with_name(
-                    f"file_{source.sha256[:16]}_{relative_digest}{path.suffix}"
-                )
-            )
-            if candidate in self._claimed_paths:
+    def _output_path(self, source: InputFileMetadata) -> str:
+        extension = _OUTPUT_EXTENSIONS.get(source.detected_format)
+        if extension is None:
+            raise ProcessingError("unsupported_format")
+        parts = source.relative_path.split("/")
+        if "\\" in source.relative_path or any(
+            part in {"", ".", ".."} for part in parts
+        ):
+            raise ProcessingError("input_path_invalid")
+        derived = ["sanitized"]
+        for depth in range(1, len(parts)):
+            digest = self._path_digest(b"directory", "/".join(parts[:depth]))
+            derived.append("d_" + digest[:16].hex().translate(_PATH_TOKEN_ALPHABET))
+            directory = "/".join(derived)
+            if self._directory_prefixes.setdefault(directory, digest) != digest:
                 raise ProcessingError("filesystem_error")
+        digest = self._path_digest(b"file", source.relative_path)
+        derived.append("f_" + digest[:16].hex().translate(_PATH_TOKEN_ALPHABET) + extension)
+        candidate = "/".join(derived)
+        if candidate in self._claimed_paths:
+            raise ProcessingError("filesystem_error")
         self._claimed_paths.add(candidate)
         return candidate
+
+    def _path_digest(self, component: bytes, relative_path: str) -> bytes:
+        return hmac.digest(
+            self._path_key,
+            b"lumen-ex/output-path/v1\0" + component + b"\0" + relative_path.encode("utf-8"),
+            "sha256",
+        )
 
     def _serialize(
         self,
@@ -276,7 +289,7 @@ class SanitizedOutputWriter:
         except UnicodeError:
             raise ProcessingError("undecodable_text") from None
 
-        extension = PurePosixPath(source.relative_path).suffix.casefold()
+        extension = _OUTPUT_EXTENSIONS.get(source.detected_format)
         if extension in {".csv", ".tsv"}:
             return self._serialize_delimited(
                 records, output_path, text, "\t" if extension == ".tsv" else ","
@@ -655,15 +668,6 @@ def _set_corresponding_value(
             original[index], transformed[index], segments[1:], value
         )
     return False
-
-
-def _safe_output_path(value: str) -> bool:
-    if not isinstance(value, str) or not value.startswith("sanitized/"):
-        return False
-    path = PurePosixPath(value)
-    return not path.is_absolute() and all(
-        part not in {"", ".", ".."} for part in path.parts
-    )
 
 
 def _parse_pointer(pointer: str) -> tuple[str, ...]:
