@@ -38,6 +38,51 @@ _FIELD_NAMES = (
     "insurance_identifier",
     "government_identifier",
 )
+_SOURCE_SYSTEM_KEYS = frozenset(
+    {
+        "facilitycode",
+        "facilityid",
+        "facilityissuer",
+        "facilityname",
+        "facilitynamespace",
+        "healthcarefacilityid",
+        "healthcareproviderid",
+        "hospitalcode",
+        "hospitalissuer",
+        "hospitalname",
+        "hospitalnamespace",
+        "identifiernamespace",
+        "identifiersystem",
+        "issuer",
+        "issuingsystem",
+        "issuingauthority",
+        "organizationid",
+        "organizationname",
+        "organisationid",
+        "organisationname",
+        "providerid",
+        "providersystem",
+        "sourcefacility",
+        "sourcefacilityid",
+        "sourcehospital",
+        "sourcehospitalid",
+        "sourceissuer",
+        "sourcenamespace",
+        "sourcesystem",
+    }
+)
+_SOURCE_CONTEXTS = frozenset(
+    {
+        "facility",
+        "identifier",
+        "issuer",
+        "organization",
+        "organisation",
+        "provider",
+        "source",
+    }
+)
+_NON_SOURCE_CONTEXTS = frozenset({"coverage", "insurance", "payer", "policy"})
 _MAX_DEPTH = 24
 _MISSING_WORDS = {"", "n/a", "na", "nil", "none", "null", "unknown", "-", "--"}
 _WORD_SEPARATORS = re.compile(r"[^\w]+", re.UNICODE)
@@ -423,17 +468,22 @@ def extract_identity(
     record_locator: str = "doc",
 ) -> PatientIdentity:
     """Project one parsed row/object or labeled note into identity-only values."""
+    source_system: str | None = None
     if isinstance(record, str):
         candidates = _extract_note_values(record)
     elif isinstance(record, Mapping):
         if record.get("resourceType") == "Patient":
             candidates = _extract_fhir_patient(record)
+            source_system = _single_identifier_namespace(candidates)
         else:
             candidates = _extract_mapping_values(record)
+            source_system = _extract_source_system(record)
     else:
         raise TypeError("identity_record_type_invalid")
 
-    return _build_identity(candidates, source_file, record_locator)
+    return _build_identity(
+        candidates, source_file, record_locator, source_system
+    )
 
 
 class PatientIdentityNormalizer:
@@ -520,9 +570,10 @@ def extract_fhir_identities(
 
 
 def _build_identity(
-    candidates: Mapping[str, list[tuple[object, str]]],
+    candidates: Mapping[str, list[tuple[object, str, str | None]]],
     source_file: str,
     record_locator: str,
+    source_system: str | None = None,
 ) -> PatientIdentity:
     normalizers = {
         "name": _normalize_name,
@@ -542,18 +593,30 @@ def _build_identity(
     invalid: set[str] = set()
     for field_name in _FIELD_NAMES:
         field_values: list[IdentityValue] = []
-        seen: set[tuple[str, str]] = set()
-        for raw, source_key in candidates.get(field_name, []):
+        seen: set[tuple[str, str, str | None]] = set()
+        for raw, source_key, value_namespace in candidates.get(field_name, []):
             original = _scalar_text(raw)
             if original is None or original.strip().casefold() in _MISSING_WORDS:
                 continue
             normalized = normalizers[field_name](raw)
             if normalized is None:
                 invalid.add(field_name)
-            unique_key = (original, source_key)
+            namespace = (
+                value_namespace or source_system
+                if field_name == "hospital_identifier"
+                else None
+            )
+            unique_key = (original, source_key, namespace)
             if unique_key not in seen:
                 seen.add(unique_key)
-                field_values.append(IdentityValue(original, normalized, source_key))
+                field_values.append(
+                    IdentityValue(
+                        original,
+                        normalized,
+                        source_key,
+                        namespace=namespace,
+                    )
+                )
         values[field_name] = tuple(field_values)
 
     metadata = (
@@ -570,10 +633,13 @@ def _build_identity(
         ),
         invalid_fields=frozenset(invalid),
         normalization_metadata=metadata,
+        source_system=source_system,
     )
 
 
-def _extract_mapping_values(record: Mapping[str, object]) -> dict[str, list[tuple[object, str]]]:
+def _extract_mapping_values(
+    record: Mapping[str, object],
+) -> dict[str, list[tuple[object, str, str | None]]]:
     candidates = _empty_candidates()
     stack: list[tuple[object, tuple[str, ...], int]] = [(record, (), 0)]
     while stack:
@@ -599,12 +665,12 @@ def _extract_mapping_values(record: Mapping[str, object]) -> dict[str, list[tupl
 
 
 def _append_combined_name_parts(
-    candidates: dict[str, list[tuple[object, str]]],
+    candidates: dict[str, list[tuple[object, str, str | None]]],
 ) -> None:
     grouped: dict[str, dict[str, list[tuple[str, str]]]] = {}
     given_parts = {"firstname", "given", "givenname"}
     family_parts = {"lastname", "family", "familyname", "surname"}
-    for raw, source_key in candidates["name"]:
+    for raw, source_key, _ in candidates["name"]:
         parts = source_key.split(".")
         key = _key_name(parts[-1])
         role = "given" if key in given_parts else "family" if key in family_parts else None
@@ -627,7 +693,7 @@ def _append_combined_name_parts(
 
 
 def _collect_mapping_scalar(
-    candidates: dict[str, list[tuple[object, str]]],
+    candidates: dict[str, list[tuple[object, str, str | None]]],
     path: tuple[str, ...],
     value: object,
 ) -> None:
@@ -685,7 +751,9 @@ def _collect_mapping_scalar(
         _append(candidates, "address", value, ".".join(path))
 
 
-def _extract_fhir_patient(patient: Mapping[str, object]) -> dict[str, list[tuple[object, str]]]:
+def _extract_fhir_patient(
+    patient: Mapping[str, object],
+) -> dict[str, list[tuple[object, str, str | None]]]:
     candidates = _empty_candidates()
     for index, name in enumerate(_as_mappings(patient.get("name"))):
         path = f"name/{index}"
@@ -707,7 +775,8 @@ def _extract_fhir_patient(patient: Mapping[str, object]) -> dict[str, list[tuple
         value = identifier.get("value")
         if _scalar_text(value) is None:
             continue
-        system = str(identifier.get("system", "")).casefold()
+        raw_system = identifier.get("system")
+        system = str(raw_system or "").casefold()
         type_text = _fhir_identifier_type(identifier.get("type"))
         identifier_context = f"{system} {type_text}"
         if any(word in identifier_context for word in ("insurance", "policy", "coverage")):
@@ -719,7 +788,19 @@ def _extract_fhir_patient(patient: Mapping[str, object]) -> dict[str, list[tuple
             target = "government_identifier"
         else:
             target = "hospital_identifier"
-        _append(candidates, target, value, f"identifier/{identifier_index}/value")
+        namespace = (
+            _normalize_source_system(raw_system)
+            if target == "hospital_identifier"
+            and isinstance(raw_system, str)
+            else None
+        )
+        _append(
+            candidates,
+            target,
+            value,
+            f"identifier/{identifier_index}/value",
+            namespace=namespace,
+        )
 
     for index, telecom in enumerate(_as_mappings(patient.get("telecom"))):
         system = str(telecom.get("system", "")).casefold()
@@ -746,7 +827,9 @@ def _extract_fhir_patient(patient: Mapping[str, object]) -> dict[str, list[tuple
     return candidates
 
 
-def _extract_note_values(note: str) -> dict[str, list[tuple[object, str]]]:
+def _extract_note_values(
+    note: str,
+) -> dict[str, list[tuple[object, str, str | None]]]:
     candidates = _empty_candidates()
     for match in _NOTE_PATTERN.finditer(note):
         label = _key_name(match.group("label"))
@@ -806,7 +889,7 @@ def _normalize_identifier_value(value: object) -> str | None:
 
 
 def _append_if_scalar(
-    candidates: dict[str, list[tuple[object, str]]],
+    candidates: dict[str, list[tuple[object, str, str | None]]],
     field_name: str,
     value: object,
     source_key: str,
@@ -835,12 +918,14 @@ def _fhir_identifier_type(value: object) -> str:
 
 
 def _append(
-    candidates: dict[str, list[tuple[object, str]]],
+    candidates: dict[str, list[tuple[object, str, str | None]]],
     field_name: str,
     value: object,
     source_key: str,
+    *,
+    namespace: str | None = None,
 ) -> None:
-    candidates[field_name].append((value, source_key))
+    candidates[field_name].append((value, source_key, namespace))
     if field_name == "name":
         text = _scalar_text(value)
         relative = _RELATIVE_NAME.search(text or "")
@@ -848,10 +933,10 @@ def _append(
             candidates[field_name].pop()
             patient_name = (text or "")[: relative.start()].strip(" ,;:-")
             if patient_name:
-                candidates[field_name].append((patient_name, source_key))
+                candidates[field_name].append((patient_name, source_key, None))
             relative_name = relative.group("name").strip()
             if not _is_clinical_relative_candidate(relative_name):
-                candidates["relative_name"].append((relative_name, source_key))
+                candidates["relative_name"].append((relative_name, source_key, None))
 
 
 def _is_clinical_relative_candidate(value: str) -> bool:
@@ -859,8 +944,68 @@ def _is_clinical_relative_candidate(value: str) -> bool:
     return bool(set(normalized.split()) & _RELATIVE_CLINICAL_TERMS)
 
 
-def _empty_candidates() -> dict[str, list[tuple[object, str]]]:
+def _empty_candidates() -> dict[str, list[tuple[object, str, str | None]]]:
     return {field_name: [] for field_name in _FIELD_NAMES}
+
+
+def _extract_source_system(record: Mapping[str, object]) -> str | None:
+    values: set[str] = set()
+    stack: list[tuple[object, tuple[str, ...], int]] = [(record, (), 0)]
+    while stack:
+        value, path, depth = stack.pop()
+        if depth > _MAX_DEPTH:
+            raise ProcessingError("identity_structure_depth_exceeded")
+        if isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                stack.append((child, path + (str(index),), depth + 1))
+            continue
+        if not isinstance(value, Mapping):
+            continue
+        for key, child in value.items():
+            if not isinstance(key, str):
+                continue
+            child_path = path + (key,)
+            normalized_key = _key_name(key)
+            contexts = {_key_name(part) for part in path}
+            if contexts & _NON_SOURCE_CONTEXTS:
+                continue
+            has_source_context = bool(contexts & _SOURCE_CONTEXTS)
+            is_source_key = normalized_key in _SOURCE_SYSTEM_KEYS or (
+                has_source_context
+                and normalized_key in {"id", "identifier", "name", "system"}
+            )
+            if is_source_key:
+                candidate = _normalize_source_system(child)
+                if candidate is not None:
+                    values.add(candidate)
+            if isinstance(child, (Mapping, list, tuple)):
+                stack.append((child, child_path, depth + 1))
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def _single_identifier_namespace(
+    candidates: Mapping[str, list[tuple[object, str, str | None]]],
+) -> str | None:
+    namespaces = {
+        namespace
+        for _, _, namespace in candidates.get("hospital_identifier", [])
+        if namespace is not None
+    }
+    return next(iter(namespaces)) if len(namespaces) == 1 else None
+
+
+def _normalize_source_system(value: object) -> str | None:
+    text = _scalar_text(value)
+    if text is None:
+        return None
+    normalized = unicodedata.normalize("NFKC", text).strip()
+    if (
+        not normalized
+        or len(normalized) > 2048
+        or any(unicodedata.category(character) == "Cc" for character in normalized)
+    ):
+        return None
+    return " ".join(normalized.split())
 
 
 def _scalar_text(value: object) -> str | None:

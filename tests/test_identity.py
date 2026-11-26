@@ -261,10 +261,45 @@ class IdentityExtractionTests(unittest.TestCase):
         patient = identities[0]
         self.assertEqual(patient.record_locator, "/entry/1/resource")
         self.assertEqual(patient.hospital_identifier[0].normalized, "MRNTEST5")
+        self.assertEqual(patient.hospital_identifier[0].namespace, "urn:hospital:mrn")
         self.assertEqual(patient.government_identifier[0].normalized, "ABHATEST6")
         self.assertEqual(patient.phone[0].normalized, "+919876543210")
         self.assertTrue(patient.address)
         self.assertTrue(patient.location)
+
+    def test_extracts_only_unambiguous_labeled_source_system(self) -> None:
+        identity = extract_identity(
+            {
+                "source_system": "urn:clinic:west",
+                "patient_name": "Asha Sharma",
+                "hospital_id": "MRN-TEST-9",
+            },
+            "records/patient.json",
+        )
+        self.assertEqual(identity.source_system, "urn:clinic:west")
+        self.assertEqual(identity.hospital_identifier[0].namespace, "urn:clinic:west")
+
+        ambiguous = extract_identity(
+            {
+                "source_system": "urn:clinic:west",
+                "issuer": "urn:clinic:east",
+                "hospital_id": "MRN-TEST-9",
+            },
+            "records/patient.json",
+        )
+        self.assertIsNone(ambiguous.source_system)
+        self.assertIsNone(ambiguous.hospital_identifier[0].namespace)
+
+        insurance_issuer = extract_identity(
+            {
+                "patient_name": "Asha Sharma",
+                "hospital_id": "MRN-TEST-9",
+                "insurance": {"issuer": "urn:insurance:example"},
+            },
+            "records/patient.json",
+        )
+        self.assertIsNone(insurance_issuer.source_system)
+        self.assertIsNone(insurance_issuer.hospital_identifier[0].namespace)
 
     def test_classifies_fhir_insurance_identifiers(self) -> None:
         identity = extract_identity(

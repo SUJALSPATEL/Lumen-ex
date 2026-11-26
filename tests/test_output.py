@@ -83,7 +83,7 @@ class SanitizedOutputWriterTests(unittest.TestCase):
             self.assertEqual(rows[1][1], "PSN-0123456789ABCDEF")
             self.assertEqual(rows[1][2], "hypertension")
 
-    def test_json_suppression_remaps_output_locator_without_mutating_source(self) -> None:
+    def test_json_omissions_remap_output_locator_without_mutating_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             input_root = root / "input"
@@ -92,7 +92,8 @@ class SanitizedOutputWriterTests(unittest.TestCase):
             (output_root / "sanitized").mkdir(parents=True)
             raw = (
                 b'{"_export_meta":{"source_path":"inbound/synthetic_marker_854.json"},'
-                b'"visits":[{"diagnosis":"discarded"},{"diagnosis":"stable"}]}'
+                b'"visits":[{"diagnosis":"discarded"},{"diagnosis":"withheld"},'
+                b'{"diagnosis":"stable"}]}'
             )
             (input_root / "visits.json").write_bytes(raw)
             source = _metadata("visits.json", raw)
@@ -100,16 +101,25 @@ class SanitizedOutputWriterTests(unittest.TestCase):
                 source, "/visits/0", {"diagnosis": "discarded"}
             )
             second = ParsedRecord(
-                source, "/visits/1", {"diagnosis": "stable"}
+                source, "/visits/1", {"diagnosis": "withheld"}
+            )
+            third = ParsedRecord(
+                source, "/visits/2", {"diagnosis": "stable"}
             )
             first_normalized = PatientIdentityNormalizer().normalize(first)
             second_normalized = PatientIdentityNormalizer().normalize(second)
+            third_normalized = PatientIdentityNormalizer().normalize(third)
             suppressed = SanitizationResult(
                 ProcessingStatus.SUPPRESSED, "/visits/0", suppressed=True
             )
+            quarantined = SanitizationResult(
+                ProcessingStatus.QUARANTINED,
+                "/visits/1",
+                error_code="invalid_record",
+            )
             sanitized = SanitizationResult(
                 ProcessingStatus.SANITIZED,
-                "/visits/1",
+                "/visits/2",
                 {"diagnosis": "stable"},
                 output_relative_path="sanitized/visits.json",
                 generalized=True,
@@ -122,12 +132,14 @@ class SanitizedOutputWriterTests(unittest.TestCase):
                 source,
                 [
                     ReleaseRecord(first, first_normalized, suppressed),
-                    ReleaseRecord(second, second_normalized, sanitized),
+                    ReleaseRecord(second, second_normalized, quarantined),
+                    ReleaseRecord(third, third_normalized, sanitized),
                 ],
             )
 
             self.assertEqual(written.manifest.status, ProcessingStatus.SANITIZED)
-            self.assertEqual(written.records[0]["loc"], "/visits/1")
+            self.assertEqual(written.records_quarantined, 1)
+            self.assertEqual(written.records[0]["loc"], "/visits/2")
             self.assertEqual(written.records[0]["out"], "/visits/0")
             self.assertEqual(
                 json.loads((output_root / "sanitized" / "visits.json").read_text())[
@@ -252,6 +264,67 @@ class SanitizedOutputWriterTests(unittest.TestCase):
             self.assertEqual(written.manifest.status, ProcessingStatus.QUARANTINED)
             self.assertEqual(written.manifest.reason, "format_mismatch")
             self.assertFalse((output_root / "sanitized" / "duplicate.csv").exists())
+
+    def test_quarantined_csv_row_is_omitted_without_discarding_safe_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_root = root / "input"
+            output_root = root / "output"
+            input_root.mkdir()
+            (output_root / "sanitized").mkdir(parents=True)
+            raw = (
+                b"diagnosis,age\n"
+                b"withheld diagnosis,30-34\n"
+                b"hypertension,35-39\n"
+            )
+            (input_root / "records.csv").write_bytes(raw)
+            source = _metadata("records.csv", raw)
+            rejected = ParsedRecord(
+                source,
+                "row:0",
+                {"diagnosis": "withheld diagnosis", "age": "30-34"},
+            )
+            retained = ParsedRecord(
+                source,
+                "row:1",
+                {"diagnosis": "hypertension", "age": "35-39"},
+            )
+            normalized_rejected = PatientIdentityNormalizer().normalize(rejected)
+            normalized_retained = PatientIdentityNormalizer().normalize(retained)
+            rejected_result = SanitizationResult(
+                ProcessingStatus.QUARANTINED,
+                "row:0",
+                error_code="invalid_record",
+            )
+            retained_result = SanitizationResult(
+                ProcessingStatus.SANITIZED,
+                "row:1",
+                {"diagnosis": "hypertension", "age": "35-39"},
+                output_structure={"headers": ["diagnosis", "age"]},
+                output_relative_path="sanitized/records.csv",
+            )
+
+            written = SanitizedOutputWriter(
+                input_root, output_root, SensitiveDataLeakScanner()
+            ).write_file(
+                source,
+                (
+                    ReleaseRecord(rejected, normalized_rejected, rejected_result),
+                    ReleaseRecord(retained, normalized_retained, retained_result),
+                ),
+            )
+
+            self.assertEqual(written.manifest.status, ProcessingStatus.SANITIZED)
+            self.assertEqual(written.records_quarantined, 1)
+            self.assertEqual(len(written.records), 1)
+            self.assertEqual(written.records[0]["loc"], "row:1")
+            with (output_root / written.manifest.output).open(
+                encoding="utf-8", newline=""
+            ) as stream:
+                self.assertEqual(
+                    list(csv.reader(stream)),
+                    [["diagnosis", "age"], ["hypertension", "35-39"]],
+                )
 
     def test_merges_header_redactions_across_records_and_preserves_column_values(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -388,7 +461,10 @@ class SanitizedOutputWriterTests(unittest.TestCase):
             records = [json.loads(line) for line in record_lines]
             self.assertTrue(all(record["patient"] for record in records))
             output_name = records[0]["file"]
-            self.assertEqual(output_name, "sanitized/cohort.csv")
+            self.assertRegex(
+                output_name,
+                r"sanitized/src_[0-9a-f]{20}/cohort\.csv",
+            )
             self.assertTrue(all(record["file"] == output_name for record in records))
             OutputContractValidator().validate(
                 output_root, report.files, records, report_data
@@ -423,7 +499,11 @@ class SanitizedOutputWriterTests(unittest.TestCase):
                 .read_text(encoding="utf-8")
                 .splitlines()
             ]
-            self.assertEqual(third_records[0]["file"], output_name)
+            self.assertNotEqual(third_records[0]["file"], output_name)
+            self.assertRegex(
+                third_records[0]["file"],
+                r"sanitized/src_[0-9a-f]{20}/cohort\.csv",
+            )
 
     def test_release_pipeline_preserves_high_precision_json_numbers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

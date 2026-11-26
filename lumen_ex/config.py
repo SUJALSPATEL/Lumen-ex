@@ -5,7 +5,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 
 from lumen_ex.errors import ConfigurationError
-from lumen_ex.value_normalization import DateOrder
+from lumen_ex.value_normalization import AmbiguousDateAction, DateOrder
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,7 @@ class PipelineConfig:
         ("registration/jeevanjyoti_patients", "dmy"),
         ("registration/arogya_legacy_export", "mdy"),
     )
+    ambiguous_date_action: AmbiguousDateAction = "redact"
 
     def __post_init__(self) -> None:
         numeric = (
@@ -64,6 +65,11 @@ class PipelineConfig:
             )
         ):
             raise ConfigurationError("configuration_value_invalid")
+        if (
+            not isinstance(self.ambiguous_date_action, str)
+            or self.ambiguous_date_action not in {"redact", "quarantine"}
+        ):
+            raise ConfigurationError("configuration_value_invalid")
         seen_prefixes: set[str] = set()
         for prefix, order in self.date_order_overrides:
             path = PurePosixPath(prefix)
@@ -102,6 +108,7 @@ _EXPECTED_KEYS = {
     "min_group_size",
     "location_hierarchy",
     "date_order_overrides",
+    "ambiguous_date_action",
 }
 
 
@@ -109,7 +116,11 @@ def load_config(path: Path | str | None = None) -> PipelineConfig:
     """Load validated policy settings without requiring a YAML dependency."""
     config_path = Path(path) if path is not None else _DEFAULT_CONFIG_PATH
     values: dict[
-        str, int | tuple[str, ...] | tuple[tuple[str, DateOrder], ...]
+        str,
+        int
+        | tuple[str, ...]
+        | tuple[tuple[str, DateOrder], ...]
+        | AmbiguousDateAction,
     ] = {}
     try:
         lines = config_path.read_text(encoding="utf-8").splitlines()
@@ -159,6 +170,15 @@ def load_config(path: Path | str | None = None) -> PipelineConfig:
                 overrides.append((prefix, _parse_date_order(order)))
             values[key] = tuple(overrides)
             continue
+        if key == "ambiguous_date_action":
+            action = value.casefold()
+            if action == "redact":
+                values[key] = "redact"
+            elif action == "quarantine":
+                values[key] = "quarantine"
+            else:
+                raise ConfigurationError("configuration_value_invalid")
+            continue
         try:
             values[key] = int(value)
         except ValueError:
@@ -174,9 +194,14 @@ def load_config(path: Path | str | None = None) -> PipelineConfig:
     date_order_overrides = values.get(
         "date_order_overrides", defaults.date_order_overrides
     )
+    ambiguous_date_action = values.get(
+        "ambiguous_date_action", defaults.ambiguous_date_action
+    )
     if not isinstance(location_hierarchy, tuple):
         raise ConfigurationError("configuration_value_invalid")
     if not isinstance(date_order_overrides, tuple):
+        raise ConfigurationError("configuration_value_invalid")
+    if ambiguous_date_action not in {"redact", "quarantine"}:
         raise ConfigurationError("configuration_value_invalid")
     if any(
         not isinstance(value, int)
@@ -189,6 +214,7 @@ def load_config(path: Path | str | None = None) -> PipelineConfig:
         min_group_size=min_group_size,
         location_hierarchy=location_hierarchy,
         date_order_overrides=date_order_overrides,
+        ambiguous_date_action=ambiguous_date_action,
     )
 
 

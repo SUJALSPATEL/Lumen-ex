@@ -7,6 +7,7 @@ import unicodedata
 
 
 DateOrder = Literal["dmy", "mdy"]
+AmbiguousDateAction = Literal["redact", "quarantine"]
 
 _AGE = re.compile(
     r"^\s*(\d{1,3})(?:\s*(?:years?|yrs?|y|saal|sal|varsh|वर्ष|साल))?"

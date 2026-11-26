@@ -46,6 +46,7 @@ class ConfigurationTests(unittest.TestCase):
             "date_order_overrides: registration/unknown=guess\n",
             "date_order_overrides: ../outside=dmy\n",
             "date_order_overrides: registration//bad=dmy\n",
+            "ambiguous_date_action: guess\n",
         ):
             with self.subTest(content=content), tempfile.TemporaryDirectory() as temporary:
                 path = Path(temporary) / "policy.yaml"

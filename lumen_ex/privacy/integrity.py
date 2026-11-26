@@ -5,6 +5,7 @@ from datetime import date
 import re
 
 from lumen_ex.errors import ProcessingError
+from lumen_ex.privacy.dates import canonicalize_date_tokens
 from lumen_ex.privacy.temporal import normalize_temporal_date
 
 
@@ -61,12 +62,27 @@ def _clinical_values(value: object, path: tuple[str, ...] = ()) -> dict[tuple[st
             name = _KEY_NORMALIZER.sub("", str(key).casefold())
             child_path = path + (str(key),)
             if any(part in name for part in _CLINICAL_KEY_PARTS):
-                result[child_path] = child
+                result[child_path] = _canonicalize_date_values(child)
             result.update(_clinical_values(child, child_path))
     elif isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
             result.update(_clinical_values(child, path + (str(index),)))
     return result
+
+
+def _canonicalize_date_values(value: object) -> object:
+    if isinstance(value, str):
+        return canonicalize_date_tokens(value)
+    if isinstance(value, Mapping):
+        return {
+            key: _canonicalize_date_values(child)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_canonicalize_date_values(child) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_canonicalize_date_values(child) for child in value)
+    return value
 
 
 def _stay_intervals(value: object) -> tuple[tuple[str, int], ...]:

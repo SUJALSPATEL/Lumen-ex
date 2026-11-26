@@ -4,3 +4,4 @@ date_shift_max_days: 180
 min_group_size: 5
 location_hierarchy: village,tehsil,district,state
 date_order_overrides: registration/sanjeevani_registration=dmy,registration/jeevanjyoti_patients=dmy,registration/arogya_legacy_export=mdy
+ambiguous_date_action: redact

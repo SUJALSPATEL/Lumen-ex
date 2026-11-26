@@ -136,9 +136,11 @@ template. The practice results expose release blockers despite format compliance
 
 ## Known limitations
 
-- Ambiguous numeric dates and any failed record can quarantine an entire file.
-  The cohort minimum can also suppress clinically valid rows when retained
-  quasi-identifiers are rare.
+- Malformed dates and file-level validation failures can quarantine a whole file.
+  Unsafe records are omitted when other records in the same structured file pass.
+  Ambiguous numeric dates without a source hint are redacted, not guessed; this
+  lowers date utility. The cohort minimum can also suppress clinically valid rows
+  when retained quasi-identifiers are rare.
 - Text detection relies on multilingual patterns and known names. Unknown
   identifiers in content or JSON envelope metadata can survive.
 - The matcher abstains when evidence is sparse or conflicting. Cross-file

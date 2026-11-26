@@ -13,6 +13,7 @@ from lumen_ex.contracts.models import (
     DetectionEntityType,
     InputFileMetadata,
     NormalizedRecord,
+    ProcessingStatus,
     SanitizationResult,
 )
 from lumen_ex.detection.pii import MultilingualPIIDetector
@@ -28,9 +29,12 @@ _JSON_SHA256_FIELD = re.compile(
     r'("(?:input_)?sha256"\s*:\s*")[0-9a-fA-F]{64}(")',
     re.IGNORECASE,
 )
-_RELEASE_PLACEHOLDER = re.compile(r"\[(?:REDACTED|LOCATION)\]")
+_RELEASE_PLACEHOLDER = re.compile(r"\[(?:REDACTED|LOCATION|DATE REDACTED)\]")
 _RELEASE_PSEUDONYM = re.compile(r"PSN-[0-9A-HJKMNP-TV-Z]{16}")
 _ENTITY_COUNT_NAMES = frozenset(item.value for item in DetectionEntityType)
+_COHORT_QUASI_IDENTIFIER_TYPES = frozenset(
+    {DetectionEntityType.DATE_OF_BIRTH, DetectionEntityType.GENDER}
+)
 
 
 class SensitiveDataLeakScanner:
@@ -62,18 +66,57 @@ class SensitiveDataLeakScanner:
     def clear_canaries(self) -> None:
         self._canaries = ()
 
-    def is_safe(self, result: SanitizationResult) -> bool:
+    def is_safe(
+        self,
+        result: SanitizationResult,
+        *,
+        sensitive_values: tuple[str, ...] = (),
+    ) -> bool:
+        allow_cohort_quasi_identifiers = (
+            result.status is ProcessingStatus.SANITIZED
+            and result.generalized
+            and result.risk_assessment is not None
+        )
         values = {
             "fields": result.output_fields,
-            "structure": result.output_structure,
             "output_relative_path": result.output_relative_path,
-            "patient_pseudonym": result.patient_pseudonym,
+            "pseudonym": result.patient_pseudonym,
             "error_code": result.error_code,
             "locator": result.locator,
         }
-        if not self.scan_value(values):
+        if not self.scan_value(
+            values,
+            sensitive_values=sensitive_values,
+            allow_cohort_quasi_identifiers=allow_cohort_quasi_identifiers,
+        ):
             return False
-        if result.output_relative_path and not self.scan_text(result.output_relative_path):
+        structure = result.output_structure
+        if isinstance(structure, dict) and isinstance(
+            structure.get("headers"), (list, tuple)
+        ):
+            header_values = structure["headers"]
+            if not all(isinstance(header, str) for header in header_values):
+                return False
+            other_structure = {
+                key: value for key, value in structure.items() if key != "headers"
+            }
+            if not self.scan_value(
+                other_structure,
+                headers=tuple(header_values),
+                sensitive_values=sensitive_values,
+                allow_cohort_quasi_identifiers=allow_cohort_quasi_identifiers,
+            ):
+                return False
+        elif not self.scan_value(
+            {"structure": structure},
+            sensitive_values=sensitive_values,
+            allow_cohort_quasi_identifiers=allow_cohort_quasi_identifiers,
+        ):
+            return False
+        if result.output_relative_path and not self.scan_text(
+            result.output_relative_path,
+            sensitive_values=sensitive_values,
+        ):
             return False
         return True
 
@@ -83,6 +126,7 @@ class SensitiveDataLeakScanner:
         *,
         filename: str | None = None,
         sensitive_values: tuple[str, ...] = (),
+        allow_cohort_quasi_identifiers: bool = False,
     ) -> bool:
         if not isinstance(text, str):
             return False
@@ -100,6 +144,7 @@ class SensitiveDataLeakScanner:
                 )
             },
             headers=(),
+            allow_cohort_quasi_identifiers=allow_cohort_quasi_identifiers,
         )
         if result.identifier_count:
             return False
@@ -114,6 +159,7 @@ class SensitiveDataLeakScanner:
         headers: tuple[str, ...] = (),
         filename: str | None = None,
         sensitive_values: tuple[str, ...] = (),
+        allow_cohort_quasi_identifiers: bool = False,
     ) -> bool:
         canaries = self._sensitive_canaries(sensitive_values)
         if self._contains_canary_value(value, canaries):
@@ -124,7 +170,11 @@ class SensitiveDataLeakScanner:
         fields_for_scan = self._mask_public_hashes(fields)
         if fields_for_scan is None:
             return False
-        return self._detect(fields_for_scan, headers=headers).identifier_count == 0
+        return self._detect(
+            fields_for_scan,
+            headers=headers,
+            allow_cohort_quasi_identifiers=allow_cohort_quasi_identifiers,
+        ).identifier_count == 0
 
     def scan_artifact_text(
         self,
@@ -132,12 +182,14 @@ class SensitiveDataLeakScanner:
         *,
         filename: str,
         sensitive_values: tuple[str, ...] = (),
+        allow_cohort_quasi_identifiers: bool = False,
     ) -> bool:
         scan_text = _JSON_SHA256_FIELD.sub(r"\1[SHA256]\2", text)
         if not self.scan_text(
             scan_text,
             filename=filename,
             sensitive_values=sensitive_values,
+            allow_cohort_quasi_identifiers=allow_cohort_quasi_identifiers,
         ):
             return False
         suffix = Path(filename).suffix.casefold()
@@ -152,6 +204,7 @@ class SensitiveDataLeakScanner:
                 payload,
                 filename=filename,
                 sensitive_values=sensitive_values,
+                allow_cohort_quasi_identifiers=allow_cohort_quasi_identifiers,
             )
         if suffix == ".jsonl":
             item_count = 0
@@ -171,6 +224,7 @@ class SensitiveDataLeakScanner:
                     payload,
                     filename=filename,
                     sensitive_values=sensitive_values,
+                    allow_cohort_quasi_identifiers=allow_cohort_quasi_identifiers,
                 ):
                     return False
             return True
@@ -196,6 +250,7 @@ class SensitiveDataLeakScanner:
                 headers=headers,
                 filename=filename,
                 sensitive_values=sensitive_values,
+                allow_cohort_quasi_identifiers=allow_cohort_quasi_identifiers,
             ):
                 return False
             item_count = len(headers)
@@ -211,6 +266,7 @@ class SensitiveDataLeakScanner:
                         if not self.scan_value(
                             {header: cell},
                             sensitive_values=sensitive_values,
+                            allow_cohort_quasi_identifiers=allow_cohort_quasi_identifiers,
                         ):
                             return False
             except csv.Error:
@@ -285,6 +341,7 @@ class SensitiveDataLeakScanner:
         fields: dict[object, object],
         *,
         headers: tuple[str, ...] = (),
+        allow_cohort_quasi_identifiers: bool = False,
     ) -> DetectionResult:
         metadata = InputFileMetadata(
             relative_path="security-scan/payload.txt",
@@ -298,9 +355,27 @@ class SensitiveDataLeakScanner:
             structure={"headers": list(headers)} if headers else {},
         )
         try:
-            return self._detector.detect(record)
+            result = self._detector.detect(record)
         except ProcessingError:
             return DetectionResult(identifier_count=1)
+        if not allow_cohort_quasi_identifiers or not result.findings:
+            return result
+        findings = tuple(
+            finding
+            for finding in result.findings
+            if finding.entity_type not in _COHORT_QUASI_IDENTIFIER_TYPES
+        )
+        if len(findings) == len(result.findings):
+            return result
+        counts: dict[str, int] = {}
+        for finding in findings:
+            entity_type = finding.entity_type.value
+            counts[entity_type] = counts.get(entity_type, 0) + 1
+        return DetectionResult(
+            identifier_count=len(findings),
+            entity_counts=counts,
+            findings=findings,
+        )
 
     def _scan_sqlite(self, path: Path, content: bytes) -> bool:
         if self._contains_canary_bytes(content):

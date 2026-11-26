@@ -26,7 +26,9 @@ and record mappings pass the M07 scanner. The scanner is a fail-closed safeguard
 recognized findings, not a guarantee of complete de-identification.
 
 The writer rereads source bytes to verify the ingestion digest and reconstruct
-the original file envelope and headers. Its contract validator independently
+the original file envelope and headers. Record-level failures are omitted when
+other records in the same structured file pass; the artifact is still scanned as a
+whole, and file-level failures remain quarantined. Its contract validator independently
 resolves published locators and verifies pseudonyms against on-disk artifacts.
 The practice truth and synthetic attacker are used by development tools only.
 
@@ -40,10 +42,10 @@ The practice truth and synthetic attacker are used by development tools only.
 | Normalization | Normalize representation while retaining source locators and medical values. `Normalizer.normalize` accepts a `ParsedRecord` and returns a `NormalizedRecord`; `PatientIdentityNormalizer` provides the identity-projection implementation. |
 | PII detection | `lumen_ex.detection.MultilingualPIIDetector` scans structured fields, free text, keys, headers, and filenames for context-labelled identity fields and validated direct identifiers. It returns typed, offset-bearing findings with values and source keys hidden from repr. It is deterministic, offline, and does not alter records; it is not a general-purpose NER model. |
 | Identity extraction and normalization | `lumen_ex.identity` projects parsed row/object values, FHIR R4 Patient resources or Bundles, and explicitly labeled English, Hindi, or Hinglish note fields into compact `PatientIdentity` values. It includes email and explicitly labeled relative names alongside identity/insurance identifiers, and patient-contact phones are distinguished from clinician context. `PatientIdentityNormalizer` attaches projections without changing parsed source fields. |
-| Identity registry storage | `lumen_ex.registry.EncryptedIdentityRegistry` stores encrypted evidence in one per-run SQLite database and keyed block indexes for candidate retrieval. It is shared across batches, removes its private database directory on close, and refuses cluster merges with transitive same-hospital identifier conflicts. |
+| Identity registry storage | `lumen_ex.registry.EncryptedIdentityRegistry` stores encrypted evidence in one per-run SQLite database and keyed block indexes for candidate retrieval. Hospital identifiers are scoped by an explicit issuer/source namespace when available; the matcher uses file-scoped namespaces when source context is absent or ambiguous. It is shared across batches, removes its private database directory on close, and refuses cluster merges with transitive same-issuer identifier conflicts. |
 | Indic name normalization | `lumen_ex.detection.indic_names` normalizes supplied Latin/Devanagari name candidates with ITRANS transliteration, Unicode, punctuation, a small honorific vocabulary, and a limited set of common Mohammad spelling variants. It preserves initials and token order; name equality is not proof of identity. |
-| Candidate matching | `lumen_ex.matching.IdentityMatcher` retrieves a bounded set of indexed candidates and applies deterministic evidence rules. A unique strong identifier, or a name plus DOB, relative name, or village and age (within one year), can support a link; names alone cannot. Ambiguous or conflicting evidence stays unresolved. `IdentityLinker` adapts results to the pipeline's LINK/DO_NOT_LINK/ABSTAIN contract. Registry cluster aliases are merged only when same-hospital identifier conflicts are absent across both transitive families. |
-| Privacy transformation | `lumen_ex.privacy.PrivacyTransformer` applies keyed pseudonyms only for LINK decisions, per-patient date shifts, truthful age bands, conservative home-location generalization, finding-based identifier redaction, and cohort quasi-identifier assessment. `transform_batch` is the release-capable API; its outputs can be sanitized, suppressed, or quarantined. |
+| Candidate matching | `lumen_ex.matching.IdentityMatcher` retrieves a bounded set of indexed candidates and applies deterministic evidence rules. A unique strong identifier, or a name plus DOB, relative name, or village and age (within one year), can support a link; names alone cannot. Ambiguous or conflicting evidence stays unresolved. `IdentityLinker` adapts results to the pipeline's LINK/DO_NOT_LINK/ABSTAIN contract. Registry cluster aliases are merged only when same-issuer hospital-identifier conflicts are absent across both transitive families. |
+| Privacy transformation | `lumen_ex.privacy.PrivacyTransformer` applies keyed pseudonyms only for LINK decisions, per-patient date shifts, truthful age bands, conservative home-location generalization, finding-based identifier redaction, and cohort quasi-identifier assessment. Sanitized paths include a keyed opaque source code, not the issuer value. `transform_batch` is the release-capable API; its outputs can be sanitized, suppressed, or quarantined. |
 | Leak scanning / security | `lumen_ex.security.SensitiveDataLeakScanner` reuses the M04 detector for structured values, text, headers, filenames, JSON/JSONL/CSV/TSV, reports, logs supplied for scanning, and on-disk files. Release artifacts and metadata are checked before publication; scan failures fail closed. |
 | Output writing | `SanitizedOutputWriter` preserves CSV/TSV delimiters and headers, updates JSON records by RFC 6901 locators, writes text as UTF-8, adds pseudonyms only to an existing identity field (or a text-note header), and quarantines whole files on serialization or scanning failures. |
 | Reporting | `PipelineReport` serializes the official `raksha-report/1` shape. `records.jsonl` maps exported input locators to output locators and pseudonyms; source names and exception text are excluded. |
@@ -69,8 +71,9 @@ The privacy package shares purpose-separated HKDF key derivation with the encryp
 registry. Pseudonyms and date shifts use distinct derived keys and HMAC domain tags;
 unlinked/abstained records receive no patient pseudonym and use a record-local date
 shift reference instead. Dates are shifted by one deterministic offset per patient or
-unresolved record, preserving time intervals. Ambiguous or malformed date-like values
-fail closed rather than being silently emitted unchanged.
+unresolved record, preserving time intervals. Source-unresolved ambiguous numeric dates
+are redacted according to `ambiguous_date_action`; malformed date-like values remain
+fail-closed rather than being silently emitted unchanged.
 
 Age bands use the configured width below 85 and an open `85+` band above it. Residence
 location follows the configured village → tehsil → district → state hierarchy, drops
@@ -95,12 +98,14 @@ available through `Pipeline.ingest_directory` and is also used directly by the
 submission `ReleasePipeline`.
 
 The registry provides encrypted storage, exact keyed block lookup, and streaming
-candidate iteration. The release uses a file digest as a conservative namespace
-for hospital-local identifiers and requires corroborating name evidence when
-that identifier is the only exact identity match. Cross-file matches rely on
-independent evidence such as a strong global identifier. The bounded matcher abstains when
-the candidate set overflows. Closing the registry removes its private database
-and SQLite sidecars.
+candidate iteration. Issuer namespaces are taken from FHIR `Identifier.system` or
+explicitly labeled source/facility/issuer metadata; the code does not infer a facility
+from patient names. A file with one unambiguous source namespace can share its hospital
+identifier block scope with other files carrying that namespace. Missing or conflicting
+source context remains file-scoped. Exact hospital-identifier matches still require
+corroborating name evidence; transliteration is not proof of identity. The bounded
+matcher abstains when the candidate set overflows. Closing the registry removes its
+private database and SQLite sidecars.
 
 ## Operational constraints
 

@@ -13,7 +13,7 @@ from lumen_ex.privacy.temporal import normalize_temporal_date
 _KEY_NORMALIZER = re.compile(r"[^a-z0-9]+")
 _QI_KEY_GROUPS = {
     "age": {"age", "ageyears", "ageband"},
-    "gender": {"gender", "sex"},
+    "gender": {"gender", "sex", "patientgender", "ling"},
     "village": {"village", "gaon", "gram", "mohalla", "locality", "town", "city"},
     "tehsil": {"tehsil", "taluk", "taluka", "subdistrict"},
     "district": {"district", "jila", "zilla"},
@@ -23,6 +23,10 @@ _QI_KEY_GROUPS = {
         "date",
         "dob",
         "dateofbirth",
+        "janmtithi",
+        "janamtithi",
+        "janmtarikh",
+        "janamtarikh",
         "admissiondate",
         "dateofadmission",
         "dischargedate",

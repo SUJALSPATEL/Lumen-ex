@@ -24,6 +24,7 @@ class IdentityValue:
     original: str = field(repr=False)
     normalized: str | None = field(repr=False)
     source_key: str = field(default="", repr=False)
+    namespace: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class PatientIdentity:
     missing_fields: frozenset[str] = frozenset()
     invalid_fields: frozenset[str] = frozenset()
     normalization_metadata: tuple[tuple[str, str], ...] = ()
+    source_system: str | None = field(default=None, repr=False)
 
 
 __all__ = [

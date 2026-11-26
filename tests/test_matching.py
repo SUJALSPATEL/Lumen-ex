@@ -21,6 +21,7 @@ def _identity(
     dob: str | None = "1982-04-13",
     phone: str | None = "+919876543210",
     hospital_id: str | None = None,
+    hospital_id_namespace: str | None = None,
     government_id: str | None = None,
     insurance_id: str | None = None,
     email: str | None = None,
@@ -28,14 +29,20 @@ def _identity(
     age: str | None = None,
     village: str | None = None,
 ) -> PatientIdentity:
-    def values(value: str | None, key: str) -> tuple[IdentityValue, ...]:
+    def values(
+        value: str | None,
+        key: str,
+        namespace: str | None = None,
+    ) -> tuple[IdentityValue, ...]:
         if value and key in {"Name", "Relative Name"}:
             normalized = normalize_name(value)
         elif value and key == "Village":
             normalized = normalize_location(value)
         else:
             normalized = value
-        return (IdentityValue(value, normalized, key),) if value else ()
+        return (
+            (IdentityValue(value, normalized, key, namespace),) if value else ()
+        )
 
     return PatientIdentity(
         source_file="synthetic.csv",
@@ -47,7 +54,9 @@ def _identity(
         phone=values(phone, "Phone"),
         email=values(email, "Email"),
         location=values(village, "Village"),
-        hospital_identifier=values(hospital_id, "PatientID"),
+        hospital_identifier=values(
+            hospital_id, "PatientID", hospital_id_namespace
+        ),
         insurance_identifier=values(insurance_id, "PolicyID"),
         government_identifier=values(government_id, "HealthID"),
     )
@@ -106,6 +115,43 @@ class IdentityMatcherTests(unittest.TestCase):
         self.assertEqual(result.patient_id, expected)
         self.assertEqual(result.reason, "unique_best_candidate")
         self.assertIn("hospital_identifier_exact", result.candidates[0].evidence)
+
+    def test_hospital_identifiers_link_only_within_the_same_issuer_namespace(self) -> None:
+        existing = _identity(
+            "row:0",
+            name="Asha Sharma",
+            dob=None,
+            phone=None,
+            hospital_id="HOSP-1",
+            hospital_id_namespace="urn:clinic:west",
+        )
+        expected = self._store("row:0", existing, namespace="file-a")
+
+        same_issuer = self.matcher.evaluate(
+            _identity(
+                "row:1",
+                name="Asha Sharma",
+                dob=None,
+                phone=None,
+                hospital_id="HOSP-1",
+                hospital_id_namespace="urn:clinic:west",
+            )
+        )
+        different_issuer = self.matcher.evaluate(
+            _identity(
+                "row:2",
+                name="Asha Sharma",
+                dob=None,
+                phone=None,
+                hospital_id="HOSP-1",
+                hospital_id_namespace="urn:clinic:east",
+            )
+        )
+
+        self.assertEqual(same_issuer.decision, IdentityDecision.LINK)
+        self.assertEqual(same_issuer.patient_id, expected)
+        self.assertEqual(different_issuer.decision, IdentityDecision.UNRESOLVED)
+        self.assertIsNone(different_issuer.patient_id)
 
     def test_name_similarity_alone_never_links_and_sparse_records_stay_unresolved(self) -> None:
         self._store(

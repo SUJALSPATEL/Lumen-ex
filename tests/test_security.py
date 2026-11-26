@@ -4,6 +4,11 @@ import tempfile
 from pathlib import Path
 import unittest
 
+from lumen_ex.contracts.models import (
+    PrivacyRiskAssessment,
+    ProcessingStatus,
+    SanitizationResult,
+)
 from lumen_ex.key_derivation import derive_key
 from lumen_ex.security import SensitiveDataLeakScanner
 
@@ -110,6 +115,69 @@ class SensitiveDataLeakScannerTests(unittest.TestCase):
         )
         self.assertFalse(
             self.scanner.scan_text(f"Name: [REDACTED] {_CANARY}")
+        )
+
+    def test_is_safe_accepts_a_patient_pseudonym_but_not_visible_pii(self) -> None:
+        safe = SanitizationResult(
+            ProcessingStatus.SANITIZED,
+            "row:0",
+            {"patient_name": "[REDACTED]"},
+            output_structure={
+                "headers": ["patient_name", "phone", "diagnosis"]
+            },
+            output_relative_path="sanitized/src_0123456789abcdef0123/file_0123456789abcdef0123.csv",
+            patient_pseudonym="PSN-0123456789ABCDEF",
+        )
+        self.assertTrue(self.scanner.is_safe(safe))
+
+        unsafe = SanitizationResult(
+            ProcessingStatus.SANITIZED,
+            "row:0",
+            {"patient_name": "Asha Sharma"},
+            output_relative_path=safe.output_relative_path,
+        )
+        self.assertFalse(self.scanner.is_safe(unsafe))
+        sensitive = "SYNTHETIC-PATIENT-IDENTIFIER-71"
+        leaked = SanitizationResult(
+            ProcessingStatus.SANITIZED,
+            "row:0",
+            {"note": f"Reference {sensitive}"},
+            output_relative_path=safe.output_relative_path,
+        )
+        self.assertFalse(
+            self.scanner.is_safe(leaked, sensitive_values=(sensitive,))
+        )
+
+    def test_only_risk_assessed_release_allows_managed_quasi_identifiers(self) -> None:
+        fields = {"ling": "female", "janmtithi": "2021-08-31"}
+        self.assertFalse(self.scanner.scan_value(fields))
+        self.assertTrue(
+            self.scanner.scan_value(
+                fields, allow_cohort_quasi_identifiers=True
+            )
+        )
+
+        assessment = PrivacyRiskAssessment(
+            records_assessed=2,
+            equivalence_classes=1,
+            unique_records=0,
+            minimum_equivalence_class_size=2,
+            mean_reidentification_risk=0.5,
+            rare_value_count=0,
+            equivalence_class_sizes=(2, 2),
+            rare_attributes_by_record=((), ()),
+        )
+        result = SanitizationResult(
+            ProcessingStatus.SANITIZED,
+            "row:0",
+            fields,
+            generalized=True,
+            output_relative_path="sanitized/records.json",
+            risk_assessment=assessment,
+        )
+        self.assertTrue(self.scanner.is_safe(result))
+        self.assertFalse(
+            self.scanner.is_safe(result, sensitive_values=("2021-08-31",))
         )
 
     def test_scans_files_and_fails_closed_for_unsupported_or_symlinked_artifacts(self) -> None:

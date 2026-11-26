@@ -45,7 +45,8 @@ with a new ID: the same person, different records.
 The privacy policy configures numeric date ordering by registration source filename
 prefix: Sanjeevani and Jeevan Jyoti are day-first, while Arogya legacy is month-first.
 These hints are applied only to date shifting. Ambiguous dates from sources without an
-explicit hint remain fail-closed and are quarantined.
+explicit hint are redacted by policy rather than guessed. Malformed date-like values
+remain fail-closed and may quarantine their source file.
 
 ## The traps (what each one tests)
 

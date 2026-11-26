@@ -24,8 +24,11 @@ structured values and keys, CSV/TSV headers and values, JSON/JSONL, free text,
 filenames, reports, and caller-supplied log text. `SanitizedOutputWriter` scans each
 complete serialized file and its record metadata before writing; the release pipeline
 then scans `records.jsonl` and `report.json`. Known M06 placeholders (`[REDACTED]`,
-`[LOCATION]`) are masked only in the scanner's in-memory copy to avoid treating the
-firewall's own replacements as identifiers. Valid generated `PSN-` pseudonyms and the
+`[LOCATION]`, `[DATE REDACTED]`) are masked only in the scanner's in-memory copy to
+avoid treating the firewall's own replacements as identifiers. Gender and shifted
+birth dates are allowed through the scanner only for generalized results with cohort
+risk assessments; original detected values are still checked against file-scoped
+canaries. Raw scanner calls remain strict. Valid generated `PSN-` pseudonyms and the
 contract's typed entity-count keys are likewise treated as release metadata in the
 scanner's in-memory copy. None of these exceptions alters the emitted artifact.
 Detected or unscannable individual artifacts

@@ -2,7 +2,7 @@
 
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 import math
 from pathlib import PurePosixPath
@@ -69,6 +69,7 @@ class PrivacyInput:
     record: NormalizedRecord
     detection: DetectionResult
     linkage: LinkageDecision
+    source_namespace: str | None = field(default=None, repr=False)
 
 
 class PrivacyTransformer:
@@ -81,7 +82,11 @@ class PrivacyTransformer:
     ) -> None:
         self.config = config or PipelineConfig()
         self._pseudonymizer = Pseudonymizer(secret)
-        self._date_shifter = DateShifter(secret, self.config.date_shift_max_days)
+        self._date_shifter = DateShifter(
+            secret,
+            self.config.date_shift_max_days,
+            self.config.ambiguous_date_action,
+        )
         self._age_generalizer = AgeGeneralizer(self.config.age_band_years)
         self._location_generalizer = LocationGeneralizer(
             self.config.location_hierarchy
@@ -204,7 +209,12 @@ class PrivacyTransformer:
         self._integrity_validator.validate(original_fields, fields)
 
         structure = self._safe_structure(record, item.detection.findings)
-        output_relative_path = self._output_relative_path(record, item.detection.findings)
+        source_namespace = item.source_namespace or f"file:{record.source.sha256}"
+        output_relative_path = self._output_relative_path(
+            record,
+            item.detection.findings,
+            source_namespace,
+        )
         _verify_findings_removed(
             item.detection.findings,
             fields,
@@ -350,15 +360,19 @@ class PrivacyTransformer:
         self,
         record: NormalizedRecord,
         findings: Sequence[DetectionFinding],
+        source_namespace: str,
     ) -> str:
         source_path = PurePosixPath(record.source.relative_path.replace("\\", "/"))
+        source_directory = (
+            f"sanitized/src_{self._pseudonymizer.source_token(source_namespace)}"
+        )
         if not any(finding.channel is DetectionChannel.FILENAME for finding in findings):
-            return f"sanitized/{source_path}"
+            return f"{source_directory}/{source_path}"
         suffix = source_path.suffix.casefold()
         if suffix not in {".csv", ".tsv", ".txt", ".json"}:
             suffix = ".dat"
         token = self._pseudonymizer.filename_token(record.source.sha256)
-        return f"sanitized/file_{token}{suffix}"
+        return f"{source_directory}/file_{token}{suffix}"
 
 
 def _rewrite_text(
