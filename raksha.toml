@@ -1,4 +1,4 @@
 [submission]
-name  = "Lumen-ex"
+name  = "That's Nice"
 setup = "python -m pip install -r requirements.txt"
 run   = "python main.py --input {input} --output {output}"
