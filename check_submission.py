@@ -82,7 +82,14 @@ def tree_digest(out: Path) -> str:
 
 
 def run_once(cmd_t: str, repo: Path, inp: Path, out: Path, secret: str, timeout: int):
-    cmd = cmd_t.replace("{input}", shlex.quote(str(inp))).replace("{output}", shlex.quote(str(out)))
+    # Platform‑aware quoting: use shlex.quote on POSIX, double‑quote on Windows
+    if os.name == "nt":
+        inp_q = f'"{inp}"'
+        out_q = f'"{out}"'
+    else:
+        inp_q = shlex.quote(str(inp))
+        out_q = shlex.quote(str(out))
+    cmd = cmd_t.replace("{input}", inp_q).replace("{output}", out_q)
     env = dict(os.environ, RAKSHA_SECRET=secret, RAKSHA_INPUT=str(inp), RAKSHA_OUTPUT=str(out),
                HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
     venv = repo / ".venv" / "bin"
