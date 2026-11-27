@@ -88,6 +88,53 @@ class ScalarNormalizationTests(unittest.TestCase):
 
 
 class IdentityExtractionTests(unittest.TestCase):
+    def test_multilingual_note_labels_and_patient_headers(self) -> None:
+        labeled = extract_identity(
+            "मरीज़ का नाम — आशा शर्मा\r\n"
+            "pita ka naam = Mohan Sharma\r\n"
+            "जन्मतिथि：१३/०४/१९८२\r\n"
+            "मोबाइल नंबर: ९८७६५४३२१०\r\n"
+            "पंजीकरण सं.: H-102 आईपीडी सं.: E-200\r\n",
+            "note.txt",
+        )
+        for field, normalized in (
+            ("name", "asha sharma"), ("relative_name", "mohan sharma"),
+            ("date_of_birth", "1982-04-13"), ("phone", "+919876543210"),
+            ("hospital_identifier", "H102"),
+        ):
+            self.assertEqual([value.normalized for value in getattr(labeled, field)], [normalized])
+        for note in (
+            "Report of Asha Sharma  40 Y / F\r\nHb 12",
+            "14:00 - Asha Sharma - K/C/O asthma",
+            "13/04/2026 22:00 - Asha Sharma ka BP 120/80",
+            "Patient ka naam: Asha Sharma",
+        ):
+            with self.subTest(note=note):
+                self.assertEqual(extract_identity(note, "note.txt").name[0].normalized, "asha sharma")
+
+    def test_clinical_note_values_and_unqualified_narrative_are_not_identifiers(self) -> None:
+        identity = extract_identity(
+            "14:00 - Serum Creatinine 1.4 mg/dL\n"
+            "14:00 - Chest Pain - K/C/O asthma\n"
+            "Report of serum creatinine: 1.4\n"
+            "C/O: cough and fever\n"
+            "Blood pressure: 120/80\nPlatelet count: 9876543210\n"
+            "Continues dose 543210\n"
+            "पंजीकरण सं.: unavailable आईपीडी सं.: E-200",
+            "note.txt",
+        )
+        self.assertFalse(identity.name or identity.relative_name or identity.phone or identity.hospital_identifier)
+
+    def test_dob_uses_source_order_and_rejects_ambiguous_or_invalid_values(self) -> None:
+        record = {"DOB": "०४/०५/१९८२"}
+        for order, expected in ((None, None), ("dmy", "1982-05-04"), ("mdy", "1982-04-05")):
+            self.assertEqual(extract_identity(record, "synthetic.csv", date_order=order)
+                             .date_of_birth[0].normalized, expected)
+        self.assertIsNone(extract_identity({"DOB": "02/31/1982"}, "synthetic.csv", date_order="mdy")
+                          .date_of_birth[0].normalized)
+        self.assertIsNone(extract_identity({"DOB": "13/04/1982"}, "synthetic.csv", date_order="mdy")
+                          .date_of_birth[0].normalized)
+
     def test_projects_csv_or_tsv_style_row_and_keeps_source_values(self) -> None:
         identity = extract_identity(
             {

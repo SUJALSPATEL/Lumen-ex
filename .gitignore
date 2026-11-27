@@ -1,4 +1,6 @@
 my_output*/
+/my_output_r03b_audit.py
+/my_output_r03b_shapes.py
 __pycache__/
 .pytest_cache/
 *.pyc

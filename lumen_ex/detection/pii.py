@@ -149,9 +149,11 @@ _KEY_TYPES: dict[DetectionEntityType, frozenset[str]] = {
         {
             "patientid",
             "patientidentifier",
+            "patientref",
             "hospitalid",
             "hospitalpatientid",
             "uhid",
+            "hospitaluhid",
             "mrn",
             "medicalrecordnumber",
             "registrationnumber",
@@ -174,6 +176,8 @@ _KEY_TYPES: dict[DetectionEntityType, frozenset[str]] = {
             "insurancepolicynumber",
             "policyid",
             "policynumber",
+            "policyno",
+            "pmjayid",
             "memberid",
             "membernumber",
             "subscriberid",
@@ -361,6 +365,14 @@ _LABEL_PATTERN = re.compile(
 _PIN_LABEL = re.compile(
     r"(?i)(?<!\w)(?:pin(?:\s*code)?|postal(?:\s*code)?|zip(?:\s*code)?)"
     r"\s*[:：=#-]?\s*(?P<value>[\d\u0966-\u096f]{6})(?!\d)"
+)
+_NOTE_ADDRESS_LINE = re.compile(
+    r"(?im)^[ \t]*(?:पता|address[ \t]*\([a-z -]{1,30}\))"
+    r"[ \t]*[:：=][ \t]*(?P<value>[^\r\n]+)"
+)
+_NOTE_HINDI_RECORD_NUMBERS = re.compile(
+    r"(?im)^[ \t]*पंजीकरण[ \t]+सं\.[ \t]*[:：=][ \t]*(?P<registration>[a-z0-9/-]+)"
+    r"[ \t]+आईपीडी[ \t]+सं\.[ \t]*[:：=][ \t]*(?P<encounter>[a-z0-9/-]+)[ \t]*(?=\r?$)"
 )
 _COMPLAINT_OR_CLINICAL_TERMS = {
     "admission",
@@ -632,6 +644,18 @@ class MultilingualPIIDetector:
                 DetectionEntityType.MEDICAL_RECORD_NUMBER,
                 text, match.start(), match.end(), source_key, channel, findings, seen,
             )
+        if channel is DetectionChannel.VALUE:
+            for match in _NOTE_ADDRESS_LINE.finditer(text):
+                self._add_match(
+                    DetectionEntityType.ADDRESS, text, *match.span("value"),
+                    source_key, channel, findings, seen,
+                )
+            for match in _NOTE_HINDI_RECORD_NUMBERS.finditer(text):
+                for group in ("registration", "encounter"):
+                    self._add_match(
+                        DetectionEntityType.MEDICAL_RECORD_NUMBER, text, *match.span(group),
+                        source_key, channel, findings, seen,
+                    )
         for match in _PIN_LABEL.finditer(text):
             self._add_match(
                 DetectionEntityType.PIN_CODE,
@@ -762,11 +786,10 @@ class MultilingualPIIDetector:
             self._find_known_names(
                 text, source_key, channel, names, findings, seen
             )
-        if channel in {
-            DetectionChannel.KEY,
-            DetectionChannel.HEADER,
-            DetectionChannel.FILENAME,
-        }:
+        if channel is DetectionChannel.FILENAME or (
+            channel in {DetectionChannel.KEY, DetectionChannel.HEADER}
+            and _compact_key(text) != "patientref"
+        ):
             for match in _KEY_NAME_VALUE.finditer(text):
                 candidate = text[match.start("value") : match.end("value")]
                 if _is_clinical_name(candidate) or _is_generic_name(candidate):
@@ -1007,6 +1030,7 @@ def _is_explicit_identifier_label(label: str) -> bool:
     return _compact_key(label) in {
         "patientid",
         "patientidentifier",
+        "patientref",
         "hospitalid",
         "hospitalpatientid",
         "uhid",

@@ -5,7 +5,7 @@ from pathlib import Path
 from lumen_ex.contracts.identity import IdentityDecision, IdentityValue, PatientIdentity
 from lumen_ex.contracts.models import InputFileMetadata, LinkageAction, NormalizedRecord
 from lumen_ex.detection.indic_names import normalize_name
-from lumen_ex.identity import normalize_location
+from lumen_ex.identity import extract_identity, normalize_location
 from lumen_ex.matching import IdentityLinker, IdentityMatcher
 from lumen_ex.registry import EncryptedIdentityRegistry
 
@@ -102,6 +102,51 @@ class IdentityMatcherTests(unittest.TestCase):
             namespace=namespace,
         )
         return patient_id
+
+    def test_patient_references_link_with_name_only_in_their_source_namespace(self) -> None:
+        def identity(reference, source):
+            return extract_identity(
+                {"name": "Asha Sharma", "patient_ref": reference, "hospital_code": source},
+                "synthetic.json",
+                "row:1",
+            )
+
+        patient = self._store("row:1", identity(" ref-101 ", "Hospital A"))
+        same = self.matcher.evaluate(identity("Patient/REF-101", "Hospital A"))
+        self.assertEqual((same.decision, same.patient_id), (IdentityDecision.LINK, patient))
+        legacy = identity(" h/25/010 ", "Hospital A")
+        self.assertEqual(legacy.hospital_identifier[0].normalized, "H/25/010")
+        bare_reference = extract_identity(
+            {"patient_ref": "REF-101", "hospital_code": "Hospital A"}, "synthetic.json"
+        )
+        self.assertEqual(self.matcher.evaluate(bare_reference).decision, IdentityDecision.UNRESOLVED)
+        for reference, source in (("REF-102", "Hospital A"), ("REF-101", "Hospital B")):
+            self.assertNotEqual(self.matcher.evaluate(identity(reference, source)).decision,
+                                IdentityDecision.LINK)
+        for reference in ("Encounter/101", "Observation/101", "OBSERVATION-101", "", "??", {}, None):
+            self.assertFalse(identity(reference, "Hospital A").hospital_identifier)
+        self.assertFalse(identity("REF-101", "").hospital_identifier)
+
+    def test_insurance_index_and_matching_require_the_same_issuer(self) -> None:
+        def identity(issuer):
+            return extract_identity({
+                "name": "Asha Sharma",
+                "coverage": {"policy_no": "Private-5432", "insurer": issuer},
+            }, "synthetic.json", "row:1")
+
+        patient = self._store("row:1", identity("Issuer A"))
+        self.assertEqual(self.registry.find_candidates("insurance_identifier", "PRIVATE5432", "Issuer A"), (patient,))
+        for other_issuer in ("Issuer B", ""):
+            self.assertFalse(self.registry.find_candidates("insurance_identifier", "PRIVATE5432", other_issuer))
+            self.assertEqual(self.matcher.evaluate(identity(other_issuer)).decision, IdentityDecision.UNRESOLVED)
+        self.assertEqual(self.matcher.evaluate(identity("Issuer A")).patient_id, patient)
+        unscoped = self._store("row:2", extract_identity(
+            {"policy_no": "Private-9876"}, "synthetic.json", "row:2",
+        ))
+        self.assertFalse(self.registry.find_candidates("insurance_identifier", "PRIVATE9876"))
+        self.assertEqual(self.registry.get_identity_values(unscoped)["insurance_identifier"][0].original,
+                         "Private-9876")
+        self.assertNotIn(b"Private-9876", self.registry.database_path.read_bytes())
 
     def test_links_exact_hospital_identifier_with_independent_name_evidence(self) -> None:
         existing = _identity("row:0", hospital_id="HOSP-1")

@@ -23,6 +23,7 @@ from lumen_ex.contracts.models import (
     ParsedRecord,
 )
 from lumen_ex.errors import ProcessingError
+from lumen_ex.identity import is_json_envelope_identity
 
 
 _HASH_CHUNK_SIZE = 1024 * 1024
@@ -500,6 +501,7 @@ def _read_json(source: InputFileMetadata, path: Path) -> Iterator[ParsedRecord]:
             yield ParsedRecord(source, "doc", _json_document(path, source.encoding))
             return
         if arrays:
+            contexts = _json_identity_contexts(path, source.encoding, arrays)
             for array_path in arrays:
                 for index, value in enumerate(
                     _json_array_items(path, array_path, source.encoding)
@@ -508,6 +510,7 @@ def _read_json(source: InputFileMetadata, path: Path) -> Iterator[ParsedRecord]:
                         source,
                         _json_pointer((*array_path, index)),
                         value,
+                        identity_context=contexts[array_path],
                     )
             return
         yield ParsedRecord(source, "doc", _json_document(path, source.encoding))
@@ -517,6 +520,71 @@ def _read_json(source: InputFileMetadata, path: Path) -> Iterator[ParsedRecord]:
         raise ProcessingError("JSONDecodeError") from None
     except OSError:
         raise ProcessingError("filesystem_error") from None
+
+
+def _json_identity_contexts(
+    path: Path,
+    encoding: str,
+    arrays: tuple[tuple[str | int, ...], ...],
+) -> dict[tuple[str | int, ...], tuple[tuple[tuple[str | int, ...], dict[str, object]], ...]]:
+    # Only follow envelope paths to known patient record arrays. An enclosing
+    # array item starts a new patient scope.
+    eligible = {}
+    for array in arrays:
+        if not array or not isinstance(array[-1], str) or array[-1].casefold() not in {
+            "items", "results", "visits",
+        }:
+            continue
+        start = max(
+            (
+                index + 1
+                for index, part in enumerate(array)
+                if isinstance(part, int) and array[index - 1] != "panels"
+            ),
+            default=0,
+        )
+        eligible[array] = tuple(array[:length] for length in range(start, len(array)))
+    if not eligible:
+        return dict.fromkeys(arrays, ())
+    owners = {owner for ancestors in eligible.values() for owner in ancestors}
+    contexts: dict[tuple[str | int, ...], dict[str, object]] = {}
+    for event_path, event, value in _walk_json_events(path, encoding):
+        if event not in _SCALAR_EVENTS:
+            continue
+        for length in range(len(event_path)):
+            owner = event_path[:length]
+            if owner not in owners:
+                continue
+            tail = event_path[length:]
+            first = tail[0]
+            if not isinstance(first, str):
+                continue
+            if any(not isinstance(part, str) for part in tail):
+                continue
+            key = first.casefold().replace("_", "")
+            patient_field = is_json_envelope_identity(tail)
+            export_hospital = key == "exportmeta" and tail[1:] == ("hospital",)
+            source_field = len(tail) == 1 and key in {
+                "hospitalname", "hospitalcode", "hospitalnamespace", "sourcesystem",
+                "sourcenamespace", "facilityid", "facilityname",
+            }
+            if not (patient_field or export_hospital or source_field):
+                continue
+            target = contexts.setdefault(owner, {})
+            for part in tail[:-1]:
+                target = target.setdefault(part, {})
+                if not isinstance(target, dict):
+                    break
+            if isinstance(target, dict):
+                target[tail[-1]] = value
+    return {
+        array: tuple(
+            (owner, context)
+            for owner in eligible.get(array, ())
+            if (context := contexts.get(owner))
+        )
+        for array in arrays
+    }
 
 
 def _read_text(source: InputFileMetadata, path: Path) -> Iterator[ParsedRecord]:

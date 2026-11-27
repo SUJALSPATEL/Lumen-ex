@@ -9,6 +9,7 @@ from unittest.mock import patch
 from lumen_ex.errors import ProcessingError
 import lumen_ex.ingestion as ingestion_module
 from lumen_ex.ingestion import StreamingIngestor
+from lumen_ex.identity import PatientIdentityNormalizer
 
 
 class StreamingIngestorTests(unittest.TestCase):
@@ -20,6 +21,51 @@ class StreamingIngestorTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_json_lab_envelopes_inherit_only_from_the_owning_patient(self) -> None:
+        groups = [
+            {
+                "patient": {"name": "Asha Sharma", "mrn": "MRN-A10"},
+                "lab": {"panel": {"results": [
+                    {"test": "Hb", "value": 12},
+                    {"test": "WBC", "value": 5, "email": "asha@example.test"},
+                    {"test": "Hb", "value": 13, "mrn": "MRN-B20"},
+                ]}},
+            },
+            {"lab": {"panel": {"results": [{"test": "Hb", "value": 14}]}}},
+        ]
+        (self.root / "nested.json").write_text(
+            json.dumps({"patient": {"name": "Other Person"}, "groups": groups}),
+            encoding="utf-8",
+        )
+        source = next(self.ingestor.discover(self.root))
+        normalizer = PatientIdentityNormalizer()
+        records = [normalizer.normalize(record) for record in self.ingestor.read(source)]
+        self.assertEqual([record.locator for record in records], [
+            "/groups/0/lab/panel/results/0", "/groups/0/lab/panel/results/1",
+            "/groups/0/lab/panel/results/2", "/groups/1/lab/panel/results/0",
+        ])
+        first, second, conflicting, empty = [record.identities[0] for record in records]
+        self.assertEqual(first.hospital_identifier, second.hospital_identifier)
+        self.assertEqual(first.name[0].original, "Asha Sharma")
+        self.assertEqual(first.inherited_fields, {"name", "hospital_identifier"})
+        self.assertEqual(second.email[0].original, "asha@example.test")
+        self.assertTrue(conflicting.context_conflict)
+        self.assertEqual(conflicting.hospital_identifier[0].original, "MRN-B20")
+        self.assertFalse(conflicting.name)
+        self.assertFalse(empty.name or empty.hospital_identifier)
+        self.assertEqual(records[0].fields, {"test": "Hb", "value": 12})
+
+    def test_json_lab_panels_share_the_root_patient(self) -> None:
+        document = {
+            "panels": [{"results": [{"value": 12}]}, {"results": [{"value": 13}]}],
+            "patient": {"name": "Asha Sharma"},
+        }
+        (self.root / "panels.json").write_text(json.dumps(document), encoding="utf-8")
+        source = next(self.ingestor.discover(self.root))
+        for record in self.ingestor.read(source):
+            identity, = PatientIdentityNormalizer().normalize(record).identities
+            self.assertEqual(identity.name[0].original, "Asha Sharma")
 
     def test_discovery_is_sorted_and_hashes_files_incrementally(self) -> None:
         second = self.root / "z.json"

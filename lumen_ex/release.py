@@ -1,7 +1,7 @@
 """Cohort orchestration for producing a validated sanitized release."""
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 import logging
 from pathlib import Path
@@ -221,7 +221,7 @@ class ReleasePipeline:
         registry: EncryptedIdentityRegistry,
         entity_counts: dict[str, int],
     ) -> tuple[_PreparedRecord, ...]:
-        normalizer = PatientIdentityNormalizer()
+        normalizer = PatientIdentityNormalizer(self.config)
         detector = MultilingualPIIDetector()
         matchers: dict[str, IdentityMatcher] = {}
         transformer = PrivacyTransformer(self.secret, self.config)
@@ -381,6 +381,11 @@ class ReleasePipeline:
                 None,
                 IdentityDecision.UNRESOLVED,
                 match.confidence,
+                evidence={
+                    field_name: [asdict(value) for value in getattr(identity, field_name)]
+                    for field_name in ("hospital_identifier", "insurance_identifier")
+                    if getattr(identity, field_name)
+                },
             )
             return LinkageDecision(LinkageAction.ABSTAIN), False
 
@@ -434,7 +439,7 @@ def _source_namespaces_by_file(
             candidates[relative_path].update(
                 value.namespace
                 for value in identity.hospital_identifier
-                if value.namespace
+                if value.namespace and value.source_key != "patient_ref"
             )
 
     namespaces: dict[str, str] = {}

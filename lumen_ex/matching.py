@@ -25,7 +25,6 @@ _STRONG_IDENTIFIERS = frozenset(
     {
         "government_identifier",
         "hospital_identifier",
-        "insurance_identifier",
         "phone",
         "email",
     }
@@ -135,15 +134,19 @@ class IdentityMatcher:
 
     def evaluate(self, identity: PatientIdentity) -> IdentityMatchResult:
         """Score only indexed candidates; do not persist a decision or merge."""
+        if identity.context_conflict:
+            return IdentityMatchResult(
+                IdentityDecision.UNRESOLVED, None, 0.0, "identity_context_conflict"
+            )
         values = _normalized_values(identity)
         candidates: dict[str, set[str]] = {}
         for field_name in _BLOCK_FIELDS:
-            if field_name == "hospital_identifier":
-                for value in identity.hospital_identifier:
+            if field_name in {"hospital_identifier", "insurance_identifier"}:
+                for value in getattr(identity, field_name):
                     normalized = value.normalized
                     namespace = _identifier_namespace(
                         value, identity.source_system, self.hospital_namespace
-                    )
+                    ) if field_name == "hospital_identifier" else value.namespace
                     if not normalized or not namespace:
                         continue
                     for patient_id in self.registry.iter_resolved_candidate_ids(
@@ -171,13 +174,14 @@ class IdentityMatcher:
                             "candidate_limit_exceeded",
                         )
 
-        has_hospital_namespace = bool(
-            identity.source_system
-            or self.hospital_namespace
-            or any(value.namespace for value in identity.hospital_identifier)
+        has_creatable_hospital_identifier = any(
+            value.normalized
+            and _identifier_namespace(value, identity.source_system, self.hospital_namespace)
+            and (value.source_key != "patient_ref" or values["name"])
+            for value in identity.hospital_identifier
         )
         if not candidates:
-            if _sufficient_for_create(values, has_hospital_namespace):
+            if _sufficient_for_create(values, has_creatable_hospital_identifier):
                 return IdentityMatchResult(
                     IdentityDecision.CREATE, None, 0.9, "no_existing_candidate"
                 )
@@ -240,7 +244,7 @@ class IdentityMatcher:
             if (
                 not has_strong_or_supported_candidate
                 and not has_cross_namespace_hospital_overlap
-                and _sufficient_for_create(values, has_hospital_namespace)
+                and _sufficient_for_create(values, has_creatable_hospital_identifier)
             ):
                 return IdentityMatchResult(
                     IdentityDecision.CREATE,
@@ -332,6 +336,13 @@ class IdentityMatcher:
                     )
                     == stored_value.namespace
                     for current in identity.hospital_identifier
+                ):
+                    exact_fields.add(field_name)
+            elif field_name == "insurance_identifier":
+                if stored_value.namespace and any(
+                    current.normalized == normalized
+                    and current.namespace == stored_value.namespace
+                    for current in identity.insurance_identifier
                 ):
                     exact_fields.add(field_name)
             elif normalized in values.get(field_name, set()):
@@ -625,6 +636,8 @@ def _has_independent_support(evidence: tuple[str, ...]) -> bool:
     )
     if "hospital_identifier_exact" in evidence_set and (name_support or has_second_clue):
         return True
+    if "insurance_identifier_exact" in evidence_set and name_support:
+        return True
     village_age = (
         "village_exact" in evidence_set
         and bool(evidence_set & {"age_exact", "age_near"})
@@ -633,14 +646,12 @@ def _has_independent_support(evidence: tuple[str, ...]) -> bool:
 
 
 def _sufficient_for_create(
-    values: dict[str, set[str]], has_hospital_namespace: bool
+    values: dict[str, set[str]], has_creatable_hospital_identifier: bool
 ) -> bool:
     has_identifier = any(
         values[field_name]
         for field_name in _STRONG_IDENTIFIERS - {"hospital_identifier"}
-    ) or (
-        has_hospital_namespace and bool(values["hospital_identifier"])
-    )
+    ) or has_creatable_hospital_identifier
     return has_identifier or bool(
         values["phone"] and values["date_of_birth"] and values["name"]
     )

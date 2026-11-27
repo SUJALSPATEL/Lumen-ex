@@ -22,6 +22,7 @@ from lumen_ex.contracts.models import (
     SanitizationResult,
 )
 from lumen_ex.errors import ProcessingError, SAFE_ERROR_CODES
+from lumen_ex.identity import is_json_envelope_identity
 from lumen_ex.ingestion import validate_fhir_document
 from lumen_ex.security import SensitiveDataLeakScanner
 
@@ -416,7 +417,13 @@ class SanitizedOutputWriter:
             return _json_dumps(document) + "\n", entries
 
         pointers: list[tuple[tuple[str, ...], ReleaseRecord, object, str | None]] = []
+        envelope_owners: set[tuple[str | int, ...]] = set()
         for item in records:
+            for owner, context in item.parsed.identity_context:
+                if owner not in envelope_owners:
+                    envelope_owners.add(owner)
+                    envelope = _get_pointer(document, tuple(map(str, owner)))
+                    _remove_envelope_identity(envelope, context)
             segments = _parse_pointer(item.parsed.locator)
             _get_pointer(document, segments)
             replacement: object = None
@@ -602,6 +609,8 @@ def _inject_patient_reference(item: ReleaseRecord, fields: object) -> str | None
         "name",
         "relative_name",
     ):
+        if field_name in identity.inherited_fields:
+            continue
         for value in getattr(identity, field_name, ()):
             segments = _identity_path(value.source_key)
             if (
@@ -615,6 +624,13 @@ def _inject_patient_reference(item: ReleaseRecord, fields: object) -> str | None
                 normalized_fields, fields, segments, patient
             ):
                 return patient
+    if (
+        identity.inherited_fields
+        and isinstance(fields, dict)
+        and "patient_ref" not in normalized_fields
+    ):
+        fields["patient_ref"] = patient
+        return patient
     return None
 
 
@@ -671,6 +687,21 @@ def _set_corresponding_value(
             original[index], transformed[index], segments[1:], value
         )
     return False
+
+
+def _remove_envelope_identity(
+    envelope: object,
+    context: Mapping[str, object],
+    path: tuple[str, ...] = (),
+) -> None:
+    if not isinstance(envelope, dict):
+        raise ProcessingError("format_mismatch")
+    for key, value in context.items():
+        child_path = (*path, key)
+        if isinstance(value, Mapping):
+            _remove_envelope_identity(envelope.get(key), value, child_path)
+        elif is_json_envelope_identity(child_path):
+            envelope.pop(key, None)
 
 
 def _parse_pointer(pointer: str) -> tuple[str, ...]:

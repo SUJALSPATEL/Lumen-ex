@@ -49,6 +49,8 @@ class PatientIdentity:
     invalid_fields: frozenset[str] = frozenset()
     normalization_metadata: tuple[tuple[str, str], ...] = ()
     source_system: str | None = field(default=None, repr=False)
+    context_conflict: bool = False
+    inherited_fields: frozenset[str] = frozenset()
 
 
 __all__ = [

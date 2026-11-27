@@ -35,6 +35,7 @@ _FIELDS = (
     "address",
     "location",
     "hospital_identifier",
+    "insurance_identifier",
     "government_identifier",
 )
 _SHA256 = hashlib.sha256
@@ -213,6 +214,8 @@ class EncryptedIdentityRegistry:
                     block_namespace = (
                         field_value.namespace or identity.source_system or namespace
                         if field_name == "hospital_identifier"
+                        else field_value.namespace
+                        if field_name == "insurance_identifier"
                         else None
                     )
                     payload = _json_bytes(
@@ -235,7 +238,9 @@ class EncryptedIdentityRegistry:
                         "patient_id=excluded.patient_id, ciphertext=excluded.ciphertext",
                         (record_key, patient_id, field_name, position, ciphertext),
                     )
-                    if field_value.normalized is not None:
+                    if field_value.normalized is not None and (
+                        field_name != "insurance_identifier" or block_namespace
+                    ):
                         self.add_block(
                             patient_id,
                             field_name,
@@ -251,7 +256,7 @@ class EncryptedIdentityRegistry:
         namespace: str = "",
     ) -> None:
         """Index a keyed feature token without storing its plaintext."""
-        if not kind or not value:
+        if not kind or not value or (kind == "insurance_identifier" and not namespace):
             return
         if not self._patient_exists(patient_id):
             raise ProcessingError("registry_reference_invalid")
@@ -290,7 +295,7 @@ class EncryptedIdentityRegistry:
     ) -> Iterator[str]:
         """Stream raw matching IDs for blocks that may contain many candidates."""
         self._ensure_open()
-        if not kind or not value:
+        if not kind or not value or (kind == "insurance_identifier" and not namespace):
             return
         namespace_token = _hmac_digest(
             self._index_key, b"namespace\x00" + namespace.encode("utf-8")
@@ -320,7 +325,7 @@ class EncryptedIdentityRegistry:
     ) -> bool:
         """Check for a different indexed value in the same patient namespace."""
         self._ensure_open()
-        if not kind or not value:
+        if not kind or not value or (kind == "insurance_identifier" and not namespace):
             return False
         if not self._patient_exists(patient_id):
             raise ProcessingError("registry_reference_invalid")

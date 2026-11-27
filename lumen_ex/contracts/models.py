@@ -101,6 +101,9 @@ class ParsedRecord:
     locator: str = field(repr=False)
     values: object = field(repr=False)
     structure: dict[str, object] = field(default_factory=dict, repr=False)
+    identity_context: tuple[tuple[tuple[str | int, ...], dict[str, object]], ...] = field(
+        default=(), repr=False
+    )
 
     def __post_init__(self) -> None:
         if not self.locator:

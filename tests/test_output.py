@@ -26,6 +26,32 @@ from lumen_ex.identity import PatientIdentityNormalizer
 
 
 class SanitizedOutputWriterTests(unittest.TestCase):
+    def test_sibling_lab_outputs_share_a_patient_and_exclude_parent_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, output = root / "input", root / "output"
+            source.mkdir()
+            parent = {"name": "Asha Sharma", "mrn": "SYN-H-5432", "phone": "9876543210"}
+            children = [{"test": "Hemoglobin", "value": value} for value in range(12, 17)]
+            (source / "results.json").write_text(
+                json.dumps({"lab": {"results": children}, "patient": parent}),
+                encoding="utf-8",
+            )
+            report = ReleasePipeline(
+                source, output, PipelineConfig(), "test-secret", SensitiveDataLeakScanner()
+            ).run()
+            self.assertEqual(report.files[0].status, ProcessingStatus.SANITIZED)
+            payload = (output / report.files[0].output).read_text(encoding="utf-8")
+            for value in parent.values():
+                self.assertNotIn(value, payload)
+            exported = json.loads(payload)["lab"]["results"]
+            rows = [json.loads(row) for row in (output / "records.jsonl").read_text().splitlines()]
+            self.assertEqual([row["loc"] for row in rows], [f"/lab/results/{i}" for i in range(5)])
+            self.assertTrue(rows[0]["patient"])
+            for row, child, result in zip(rows, children, exported, strict=True):
+                self.assertEqual(row["patient"], rows[0]["patient"])
+                self.assertEqual(result, {**child, "patient_ref": row["patient"]})
+
     def test_release_preserves_lab_columns_and_clinical_note_phrases(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

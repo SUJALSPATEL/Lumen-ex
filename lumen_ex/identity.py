@@ -5,6 +5,7 @@ decide whether two identity projections belong to the same person.
 """
 
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import date, datetime
 import re
 import unicodedata
@@ -13,6 +14,7 @@ from typing import TypeAlias
 import phonenumbers
 from phonenumbers import NumberParseException, PhoneNumberFormat
 
+from lumen_ex.config import PipelineConfig
 from lumen_ex.contracts.identity import IdentityValue, PatientIdentity
 from lumen_ex.contracts.models import (
     InputFormat,
@@ -21,7 +23,7 @@ from lumen_ex.contracts.models import (
 )
 from lumen_ex.detection.indic_names import normalize_name, transliterate_to_latin
 from lumen_ex.errors import ProcessingError
-from lumen_ex.value_normalization import normalize_age, normalize_date
+from lumen_ex.value_normalization import DateOrder, normalize_age, normalize_date
 
 
 _FIELD_NAMES = (
@@ -206,6 +208,7 @@ _ALIASES: dict[str, frozenset[str]] = {
             "hospitalid",
             "hospitalpatientid",
             "uhid",
+            "hospitaluhid",
             "mrn",
             "medicalrecordnumber",
             "registrationnumber",
@@ -221,6 +224,8 @@ _ALIASES: dict[str, frozenset[str]] = {
             "insurancepolicynumber",
             "policyid",
             "policynumber",
+            "policyno",
+            "pmjayid",
             "memberid",
             "membernumber",
             "subscriberid",
@@ -286,6 +291,7 @@ _NOTE_LABELS: dict[str, tuple[str, ...]] = {
         "naam",
         "patient ka naam",
         "mareez ka naam",
+        "मरीज़ का नाम",
         "रोगी का नाम",
         "मरीज का नाम",
         "नाम",
@@ -297,6 +303,9 @@ _NOTE_LABELS: dict[str, tuple[str, ...]] = {
         "husband name",
         "wife name",
         "spouse name",
+        "pita ka naam",
+        "पिता का नाम",
+        "पति का नाम",
         "s/o",
         "d/o",
         "w/o",
@@ -310,6 +319,7 @@ _NOTE_LABELS: dict[str, tuple[str, ...]] = {
         "janam tithi",
         "janm tarikh",
         "janam tarikh",
+        "जन्मतिथि",
         "जन्म तिथि",
     ),
     "age": ("age", "umar", "umr", "उम्र", "आयु"),
@@ -320,6 +330,8 @@ _NOTE_LABELS: dict[str, tuple[str, ...]] = {
         "phone",
         "mobile number",
         "mobile no",
+        "mobile no.",
+        "मोबाइल नंबर",
         "mobile",
         "contact number",
         "sampark number",
@@ -348,6 +360,9 @@ _NOTE_LABELS: dict[str, tuple[str, ...]] = {
         "mrn",
         "hospital id",
         "registration number",
+        "mrn no.",
+        "रोगी आईडी",
+        "पंजीकरण सं.",
     ),
     "insurance_identifier": (
         "insurance id",
@@ -376,13 +391,32 @@ _NOTE_LABEL_ALTERNATIVES = sorted(
     reverse=True,
 )
 _NOTE_PATTERN = re.compile(
-    r"(?im)^\s*(?P<label>"
+    r"(?im)^[^\S\r\n]*(?P<label>"
     + "|".join(
-        r"\s+".join(re.escape(part) for part in label.split())
+        r"[^\S\r\n]+".join(re.escape(part) for part in label.split())
         for label, _ in _NOTE_LABEL_ALTERNATIVES
     )
-    + r")\s*[:：=\-]\s*(?P<value>[^\r\n]+)"
+    + r")[^\S\r\n]*[:：=\-–—][^\S\r\n]*(?P<value>[^\r\n]+)"
 )
+_REPORT_PATIENT = re.compile(
+    r"(?i)^[ \t]*Report of[ \t]+(?P<name>[^\d\r\n:;=]+?)[ \t]{2,}"
+    r"(?:age[ \t]*[:=]?[ \t]*)?(?P<age>\d{1,3})[ \t]*(?:y[ \t]*)?/[ \t]*"
+    r"(?P<gender>[MFX])[ \t]*$"
+)
+_NOTE_HANDOFF = re.compile(
+    r"(?i)^[ \t]*(?:(?:\d{1,4}[-/.]){2}\d{1,4}[ \t]+)?"
+    r"\d{2}:\d{2}[ \t]+[-–—][ \t]+"
+    r"(?P<name>[^\d\r\n:;=/-]+?)[ \t]+"
+    r"(?:[-–—][ \t]+k/c/o\b|ka[ \t]+BP[ \t]*[:=]?[ \t]*\d{2,3}/\d{2,3}\b)"
+)
+_PATIENT_REF = re.compile(r"[A-Z0-9]+(?:[._-][A-Z0-9]+)*", re.ASCII)
+_LEGACY_PATIENT_REF = re.compile(r"[A-Z]+/[0-9]+/[0-9]+", re.ASCII)
+_NON_PATIENT_REF = re.compile(
+    r"^(?:ENCOUNTER|OBSERVATION|PRACTITIONER|RELATEDPERSON)(?:[./_-]|$)"
+)
+_INSURANCE_ISSUER_KEYS = {
+    "insuranceissuer", "insuranceprovider", "insurer", "payer", "policyissuer",
+}
 _NOTE_LABEL_LOOKUP = {
     re.sub(r"[^\w]+", "", label.casefold()): field_name
     for label, field_name in _NOTE_LABEL_ALTERNATIVES
@@ -466,31 +500,50 @@ def extract_identity(
     record: IdentityInput,
     source_file: str,
     record_locator: str = "doc",
+    *,
+    date_order: DateOrder | None = None,
+    source_namespace: str | None = None,
 ) -> PatientIdentity:
     """Project one parsed row/object or labeled note into identity-only values."""
     source_system: str | None = None
+    systems: set[str] = set()
     if isinstance(record, str):
         candidates = _extract_note_values(record)
     elif isinstance(record, Mapping):
         if record.get("resourceType") == "Patient":
             candidates = _extract_fhir_patient(record)
             source_system = _single_identifier_namespace(candidates)
+            date_order = None
         else:
             candidates = _extract_mapping_values(record)
-            source_system = _extract_source_system(record)
+            systems = _extract_source_systems(record)
+            source_system = next(iter(systems)) if len(systems) == 1 else None
+            source_system = source_system or (source_namespace if not systems else None)
+            reference = record.get("patient_ref")
+            if source_system and isinstance(reference, str) and _normalize_patient_reference(reference):
+                _append(
+                    candidates, "hospital_identifier", reference, "patient_ref",
+                    namespace=f"patient-ref:{source_system}",
+                )
     else:
         raise TypeError("identity_record_type_invalid")
 
-    return _build_identity(
-        candidates, source_file, record_locator, source_system
+    identity = _build_identity(
+        candidates, source_file, record_locator, source_system, date_order
     )
+    return replace(identity, context_conflict=True) if len(systems) > 1 else identity
 
 
 class PatientIdentityNormalizer:
     """Attach identity projections while preserving parsed clinical source values."""
 
+    def __init__(self, config: PipelineConfig | None = None) -> None:
+        self.config = config or PipelineConfig()
+
     def normalize(self, record: ParsedRecord) -> NormalizedRecord:
         values = record.values
+        source = record.source.relative_path
+        order = self.config.date_order_for_source(source)
         fields = dict(values) if isinstance(values, Mapping) else {"value": values}
         if record.source.detected_format is InputFormat.FHIR and isinstance(values, Mapping):
             identities = extract_fhir_identities(
@@ -506,22 +559,29 @@ class PatientIdentityNormalizer:
                     values["text"],
                     record.source.relative_path,
                     record.locator,
+                    date_order=order,
                 ),
             )
         elif isinstance(values, Mapping):
-            identities = (
-                extract_identity(
-                    values,
-                    record.source.relative_path,
-                    record.locator,
-                ),
+            parent = None
+            for _, context in record.identity_context:
+                current = extract_identity(
+                    context, source, record.locator, date_order=order,
+                    source_namespace=parent.source_system if parent else None,
+                )
+                parent = _inherit_identity(current, parent)
+            child = extract_identity(
+                values, source, record.locator, date_order=order,
+                source_namespace=parent.source_system if parent else None,
             )
+            identities = (_inherit_identity(child, parent),)
         elif isinstance(values, str):
             identities = (
                 extract_identity(
                     values,
                     record.source.relative_path,
                     record.locator,
+                    date_order=order,
                 ),
             )
         else:
@@ -569,16 +629,62 @@ def extract_fhir_identities(
     return tuple(identities)
 
 
+def _inherit_identity(
+    child: PatientIdentity, parent: PatientIdentity | None
+) -> PatientIdentity:
+    if parent is None:
+        return child
+    conflict = child.context_conflict or parent.context_conflict or bool(
+        child.source_system and parent.source_system
+        and child.source_system != parent.source_system
+    )
+    for field_name in (
+        "name", "relative_name", "date_of_birth", "gender", "hospital_identifier", "government_identifier",
+        "insurance_identifier", "phone", "email",
+    ):
+        before = {
+            (value.namespace, value.normalized)
+            for value in getattr(parent, field_name) if value.normalized
+        }
+        after = {
+            (value.namespace, value.normalized)
+            for value in getattr(child, field_name) if value.normalized
+        }
+        for namespace in {scope for scope, _ in before | after}:
+            parent_values = {value for scope, value in before if scope == namespace}
+            child_values = {value for scope, value in after if scope == namespace}
+            if parent_values and child_values and (
+                parent_values.isdisjoint(child_values)
+                or (field_name.endswith("_identifier") and parent_values != child_values)
+            ):
+                conflict = True
+    if conflict:
+        return replace(child, context_conflict=True)
+    inherited = {
+        field_name: getattr(parent, field_name)
+        for field_name in child.missing_fields
+        if getattr(parent, field_name)
+    }
+    return replace(
+        child,
+        **inherited,
+        inherited_fields=frozenset(inherited),
+        missing_fields=child.missing_fields - inherited.keys(),
+        invalid_fields=child.invalid_fields | (parent.invalid_fields & inherited.keys()),
+    )
+
+
 def _build_identity(
     candidates: Mapping[str, list[tuple[object, str, str | None]]],
     source_file: str,
     record_locator: str,
     source_system: str | None = None,
+    date_order: DateOrder | None = None,
 ) -> PatientIdentity:
     normalizers = {
         "name": _normalize_name,
         "relative_name": _normalize_name,
-        "date_of_birth": _normalize_date_value,
+        "date_of_birth": lambda value: _normalize_date_value(value, date_order),
         "age": _normalize_age_value,
         "gender": _normalize_gender_value,
         "phone": _normalize_phone_value,
@@ -598,13 +704,17 @@ def _build_identity(
             original = _scalar_text(raw)
             if original is None or original.strip().casefold() in _MISSING_WORDS:
                 continue
-            normalized = normalizers[field_name](raw)
+            normalized = (
+                _normalize_patient_reference(original)
+                if field_name == "hospital_identifier" and source_key == "patient_ref"
+                else normalizers[field_name](raw)
+            )
             if normalized is None:
                 invalid.add(field_name)
             namespace = (
                 value_namespace or source_system
                 if field_name == "hospital_identifier"
-                else None
+                else value_namespace if field_name == "insurance_identifier" else None
             )
             unique_key = (original, source_key, namespace)
             if unique_key not in seen:
@@ -622,7 +732,7 @@ def _build_identity(
     metadata = (
         ("schema", "patient-identity/1"),
         ("name_normalization", "indic-transliteration ITRANS; order and initials retained"),
-        ("date_policy", "ISO output; ambiguous numeric dates are invalid unless source-specific parsing is added"),
+        ("date_policy", "ISO output; ambiguous numeric dates require configured source order"),
     )
     return PatientIdentity(
         source_file=source_file,
@@ -641,25 +751,25 @@ def _extract_mapping_values(
     record: Mapping[str, object],
 ) -> dict[str, list[tuple[object, str, str | None]]]:
     candidates = _empty_candidates()
-    stack: list[tuple[object, tuple[str, ...], int]] = [(record, (), 0)]
+    stack: list[tuple[object, tuple[str, ...], Mapping[str, object]]] = [(record, (), record)]
     while stack:
-        value, path, depth = stack.pop()
-        if depth > _MAX_DEPTH:
+        value, path, owner = stack.pop()
+        if len(path) > _MAX_DEPTH:
             raise ProcessingError("identity_structure_depth_exceeded")
         if isinstance(value, Mapping):
             for key, child in value.items():
                 if not isinstance(key, str):
                     continue
                 child_path = path + (key,)
-                stack.append((child, child_path, depth + 1))
+                stack.append((child, child_path, value))
             continue
         if isinstance(value, (list, tuple)):
             for index, child in enumerate(value):
-                stack.append((child, path + (str(index),), depth + 1))
+                stack.append((child, path + (str(index),), owner))
             continue
         if _scalar_text(value) is None:
             continue
-        _collect_mapping_scalar(candidates, path, value)
+        _collect_mapping_scalar(candidates, path, value, owner)
     _append_combined_name_parts(candidates)
     return candidates
 
@@ -696,6 +806,7 @@ def _collect_mapping_scalar(
     candidates: dict[str, list[tuple[object, str, str | None]]],
     path: tuple[str, ...],
     value: object,
+    owner: Mapping[str, object],
 ) -> None:
     key = _key_name(path[-1])
     contexts = {_key_name(part) for part in path[:-1]}
@@ -744,11 +855,32 @@ def _collect_mapping_scalar(
     }:
         if field_name == "address" and contexts & {"contact", "telecom"}:
             return
-        _append(candidates, field_name, value, ".".join(path))
+        namespace = _insurance_issuer(owner, key) if field_name == "insurance_identifier" else None
+        _append(candidates, field_name, value, ".".join(path), namespace=namespace)
     elif key in {"line", "street", "streetaddress", "house"} and "address" in contexts:
         _append(candidates, "address", value, ".".join(path))
     elif key.isdecimal() and "address" in contexts:
         _append(candidates, "address", value, ".".join(path))
+
+
+def is_json_envelope_identity(path: tuple[str, ...]) -> bool:
+    """Recognize patient details outside a selected JSON record array."""
+    keys = tuple(map(_key_name, path))
+    if len(keys) == 1:
+        return keys[0] in {
+            "patientname", "patientfullname", "patientid", "patientidentifier",
+            "patientdob", "hospitaluhid", "uhid", "mrn",
+        }
+    if keys[0] != "patient" or not set(keys[1:-1]) <= {
+        "name", "relative", "father", "mother", "spouse", "contact", "address",
+        "insurance", "coverage",
+    }:
+        return False
+    return (
+        keys[-1] in _NAME_PARTS | _INSURANCE_ISSUER_KEYS
+        or any(keys[-1] in aliases for aliases in _ALIASES.values())
+        or ("address" in keys[1:-1] and keys[-1] in {"line", "street", "house"})
+    )
 
 
 def _extract_fhir_patient(
@@ -790,7 +922,7 @@ def _extract_fhir_patient(
             target = "hospital_identifier"
         namespace = (
             _normalize_source_system(raw_system)
-            if target == "hospital_identifier"
+            if target in {"hospital_identifier", "insurance_identifier"}
             and isinstance(raw_system, str)
             else None
         )
@@ -835,8 +967,39 @@ def _extract_note_values(
         label = _key_name(match.group("label"))
         field_name = _NOTE_LABEL_LOOKUP.get(label)
         if field_name is not None:
-            _append(candidates, field_name, match.group("value").strip(), label)
+            value = match.group("value").strip()
+            if label == _key_name("पंजीकरण सं."):
+                value = re.split(r"[ \t]+आईपीडी[ \t]+सं\.[ \t]*[:：=]", value, maxsplit=1)[0]
+                if not _normalize_patient_reference(value):
+                    continue
+            if field_name == "relative_name" and _is_clinical_relative_candidate(value):
+                continue
+            _append(candidates, field_name, value, label)
+    if not candidates["name"]:
+        for line in note.splitlines():
+            header = _REPORT_PATIENT.fullmatch(line)
+            match = header or _NOTE_HANDOFF.match(line)
+            if match is None or not _is_note_patient_name(match["name"]):
+                continue
+            _append(candidates, "name", match["name"].strip(), "patient note header")
+            if header:
+                for field_name in ("age", "gender"):
+                    _append(candidates, field_name, header[field_name], "report header")
     return candidates
+
+
+def _is_note_patient_name(value: str) -> bool:
+    words = value.split()
+    return (
+        2 <= len(words) <= 6
+        and all(
+            word[0].isalpha()
+            and all(char.isalpha() or unicodedata.category(char).startswith("M")
+                    or char in ".'’-" for char in word)
+            for word in words
+        )
+        and not _is_clinical_relative_candidate(value)
+    )
 
 
 def _normalize_name(value: object) -> str | None:
@@ -845,11 +1008,13 @@ def _normalize_name(value: object) -> str | None:
     return normalized or None
 
 
-def _normalize_date_value(value: object) -> str | None:
+def _normalize_date_value(
+    value: object, date_order: DateOrder | None = None
+) -> str | None:
     if isinstance(value, (date, datetime)):
-        return normalize_date(value)
+        return normalize_date(value, date_order=date_order)
     text = _scalar_text(value)
-    return normalize_date(text) if text is not None else None
+    return normalize_date(text, date_order=date_order) if text is not None else None
 
 
 def _normalize_age_value(value: object) -> str | None:
@@ -886,6 +1051,19 @@ def _normalize_location_value(value: object) -> str | None:
 def _normalize_identifier_value(value: object) -> str | None:
     text = _scalar_text(value)
     return normalize_identifier(text) if text is not None else None
+
+
+def _normalize_patient_reference(value: str) -> str | None:
+    token = _ascii_digits(unicodedata.normalize("NFKC", value)).strip().upper()
+    token = token.removeprefix("PATIENT/")
+    if (
+        len(token) <= 128
+        and (_PATIENT_REF.fullmatch(token) or _LEGACY_PATIENT_REF.fullmatch(token))
+        and any(character.isdecimal() for character in token)
+        and not _NON_PATIENT_REF.match(token)
+    ):
+        return token
+    return None
 
 
 def _append_if_scalar(
@@ -948,7 +1126,19 @@ def _empty_candidates() -> dict[str, list[tuple[object, str, str | None]]]:
     return {field_name: [] for field_name in _FIELD_NAMES}
 
 
-def _extract_source_system(record: Mapping[str, object]) -> str | None:
+def _insurance_issuer(owner: Mapping[str, object], key: str) -> str | None:
+    issuers = {
+        issuer
+        for label, value in owner.items()
+        if isinstance(label, str) and _key_name(label) in _INSURANCE_ISSUER_KEYS
+        and (issuer := _normalize_source_system(value))
+    }
+    if len(issuers) == 1:
+        return next(iter(issuers))
+    return "PM-JAY" if not issuers and key == "pmjayid" else None
+
+
+def _extract_source_systems(record: Mapping[str, object]) -> set[str]:
     values: set[str] = set()
     stack: list[tuple[object, tuple[str, ...], int]] = [(record, (), 0)]
     while stack:
@@ -971,6 +1161,8 @@ def _extract_source_system(record: Mapping[str, object]) -> str | None:
                 continue
             has_source_context = bool(contexts & _SOURCE_CONTEXTS)
             is_source_key = normalized_key in _SOURCE_SYSTEM_KEYS or (
+                normalized_key == "hospital" and path == ("_export_meta",)
+            ) or (
                 has_source_context
                 and normalized_key in {"id", "identifier", "name", "system"}
             )
@@ -980,7 +1172,7 @@ def _extract_source_system(record: Mapping[str, object]) -> str | None:
                     values.add(candidate)
             if isinstance(child, (Mapping, list, tuple)):
                 stack.append((child, child_path, depth + 1))
-    return next(iter(values)) if len(values) == 1 else None
+    return values
 
 
 def _single_identifier_namespace(
@@ -1001,6 +1193,7 @@ def _normalize_source_system(value: object) -> str | None:
     normalized = unicodedata.normalize("NFKC", text).strip()
     if (
         not normalized
+        or normalized.casefold() in _MISSING_WORDS
         or len(normalized) > 2048
         or any(unicodedata.category(character) == "Cc" for character in normalized)
     ):
