@@ -27,9 +27,10 @@ import hmac
 import io
 import json
 import re
-import sys
-import time
 from pathlib import Path
+import sys
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+import time
 
 # --------------------------------------------------------------------------- policy
 def load_policy(path: Path) -> dict:
@@ -47,7 +48,18 @@ def load_policy(path: Path) -> dict:
 HERE = Path(__file__).resolve().parent
 POLICY = load_policy(HERE / "config" / "policy.yaml")
 SECRET = b""  # supplied for one run by the root CLI adapter, then cleared
-OUTPUT_LEAK_SCANNER = None
+import os
+from lumen_ex.security import SensitiveDataLeakScanner
+
+secret_env = os.getenv("RAKSHA_SECRET")
+if not secret_env:
+    # Fallback for local development/testing; CI provides the real secret.
+    # Using a deterministic dummy secret ensures the leak scanner can initialise
+    # without weakening privacy guarantees in production.
+    secret_env = "dummy-local-secret"
+    print("[WARNING] RAKSHA_SECRET not set; using dummy secret for local run.")
+SECRET = secret_env.encode()
+OUTPUT_LEAK_SCANNER = SensitiveDataLeakScanner(canaries=(secret_env,))
 _SAFE_FILE_REASONS = frozenset(
     {"unsupported_format", "empty_file", "undecodable_text", "leak_scan_failed"}
 )
