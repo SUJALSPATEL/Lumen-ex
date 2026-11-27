@@ -420,6 +420,98 @@ class PrivacyTransformerTests(unittest.TestCase):
         self.assertEqual(invalid_date.status, ProcessingStatus.QUARANTINED)
         self.assertEqual(invalid_date.error_code, "privacy_date_invalid")
 
+    def test_fhir_resource_context_findings_are_removed(self) -> None:
+        from lumen_ex.detection import MultilingualPIIDetector
+
+        record = _record(41, {
+            "resourceType": "Bundle",
+            "entry": [
+                {"resource": {
+                    "resourceType": "Patient",
+                    "name": [{"family": "Mehta"}],
+                    "identifier": [{"value": "MRN-12345"}],
+                }},
+                {"resource": {
+                    "resourceType": "Observation",
+                    "valueQuantity": {"value": 140, "unit": "mmol/L"},
+                }},
+            ],
+        })
+        findings = MultilingualPIIDetector().detect(record)
+        self.assertGreater(findings.identifier_count, 0)
+        result = PrivacyTransformer("privacy-secret")._transform_one(PrivacyInput(
+            record, findings, LinkageDecision(LinkageAction.ABSTAIN)
+        ))
+        self.assertEqual(result.status, ProcessingStatus.SANITIZED)
+        self.assertNotIn("Mehta", str(result.output_fields))
+        self.assertNotIn("MRN-12345", str(result.output_fields))
+        observation = result.output_fields["entry"][1]["resource"]
+        self.assertEqual(observation["valueQuantity"], {"value": 140, "unit": "mmol/L"})
+
+    def test_repeated_patient_name_in_one_note_is_fully_removed(self) -> None:
+        record = _record(42, {"text": "Patient Asha Mehta. Asha Mehta returned. Asha Mehtab reviewed."})
+        record_findings = DetectionResult(
+            identifier_count=1,
+            findings=(DetectionFinding(
+                DetectionEntityType.PATIENT_NAME,
+                "Asha Mehta", "text", DetectionChannel.VALUE, 8, 18,
+            ),),
+        )
+        result = PrivacyTransformer("privacy-secret")._transform_one(PrivacyInput(
+            record,
+            record_findings,
+            LinkageDecision(LinkageAction.ABSTAIN),
+        ))
+        self.assertEqual(result.status, ProcessingStatus.SANITIZED)
+        self.assertNotIn("Patient Asha Mehta.", str(result.output_fields))
+        self.assertNotIn("Asha Mehta returned", str(result.output_fields))
+        self.assertIn("Asha Mehtab reviewed", str(result.output_fields))
+
+    def test_fhir_secondary_identifier_references_and_notes_are_redacted(self) -> None:
+        from lumen_ex.detection import MultilingualPIIDetector
+
+        record = _record(43, {
+            "resourceType": "Bundle",
+            "id": "bundle-uuid-9999",
+            "identifier": {"value": "bundle-uuid-9999"},
+            "entry": [
+                {
+                    "fullUrl": "urn:uuid:patient-uuid-1234",
+                    "resource": {
+                        "resourceType": "Patient",
+                        "id": "patient-uuid-1234",
+                        "text": {"div": "<div>MRN: UHID-010607</div>"},
+                        "identifier": [{"value": "UHID-010607"}],
+                        "name": [{"text": "Asha Mehta"}],
+                    },
+                },
+                {
+                    "resource": {
+                        "resourceType": "Observation",
+                        "subject": {"reference": "Patient/patient-uuid-1234"},
+                        "note": [{"text": "Asha Mehta reported mild fever."}],
+                    }
+                },
+            ],
+        })
+        findings = MultilingualPIIDetector().detect(record)
+        result = PrivacyTransformer("privacy-secret")._transform_one(
+            PrivacyInput(record, findings, LinkageDecision(LinkageAction.ABSTAIN))
+        )
+        self.assertEqual(result.status, ProcessingStatus.SANITIZED)
+        serialized = str(result.output_fields)
+        self.assertNotIn("bundle-uuid-9999", serialized)
+        self.assertNotIn("patient-uuid-1234", serialized)
+        self.assertNotIn("UHID-010607", serialized)
+        self.assertNotIn("Asha Mehta", serialized)
+        self.assertIn("mild fever", serialized)
+
+    def test_village_mohalla_column_is_generalized_to_broader_location(self) -> None:
+        generalized = LocationGeneralizer().generalize(
+            {"Village/Mohalla": "Amardih", "District": "Hardoi", "State": "Uttar Pradesh"}
+        )
+        self.assertEqual(generalized["Village/Mohalla"], "Hardoi")
+
 
 def _record(index: int, fields: dict[str, object]) -> NormalizedRecord:
     content = f"synthetic-{index}".encode("utf-8")

@@ -238,6 +238,25 @@ class SensitiveDataLeakScannerTests(unittest.TestCase):
             (root / _CANARY).mkdir()
             self.assertFalse(self.scanner.scan_tree(root))
 
+    def test_structured_artifact_and_redacted_note_placeholders_do_not_false_positive(self) -> None:
+        note_text = "UHID: [REDACTED]\nपता: [LOCATION]\nClinical course: Afebrile."
+        self.assertTrue(
+            self.scanner.scan_text(note_text, filename="sanitized/d_a/f_b.txt")
+        )
+        structured_json = (
+            '{\n'
+            '  "hospital": "Jeevan Jyoti Hospital",\n'
+            '  "lab": "Arogya Diagnostic Centre",\n'
+            '  "patient": "[REDACTED]",\n'
+            '  "remarks": "attendant (W/o [REDACTED])"\n'
+            '}'
+        )
+        self.assertTrue(
+            self.scanner.scan_artifact_text(
+                structured_json, filename="sanitized/d_a/f_b.json"
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

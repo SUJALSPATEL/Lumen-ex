@@ -11,7 +11,7 @@ _AGE_BAND = re.compile(r"^(\d+)-(\d+)$")
 _AGE_OPEN_BAND = re.compile(r"^(\d+)\+$")
 _KEY_NORMALIZER = re.compile(r"[^a-z0-9]+")
 
-_VILLAGE_KEYS = {"village", "gaon", "gram", "mohalla", "locality", "town", "city"}
+_VILLAGE_KEYS = {"village", "villagemohalla", "gaon", "gram", "mohalla", "locality", "town", "city"}
 _DISTRICT_KEYS = {"district", "jila", "zilla"}
 _TEHSIL_KEYS = {"tehsil", "taluk", "taluka", "subdistrict"}
 _STATE_KEYS = {"state", "province"}

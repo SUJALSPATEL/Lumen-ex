@@ -542,9 +542,15 @@ def _sensitive_values(item: _PreparedRecord) -> tuple[str, ...]:
             "insurance_identifier",
             "government_identifier",
         ):
-            values.update(
-                field_value.original
-                for field_value in getattr(identity, field_name)
-                if len(field_value.original) >= 4
-            )
+            for field_value in getattr(identity, field_name):
+                if len(field_value.original) < 4:
+                    continue
+                if field_name == "location":
+                    leaf_key = "".join(
+                        ch for ch in field_value.source_key.split("/")[-1].casefold()
+                        if ch.isalnum()
+                    )
+                    if leaf_key in {"district", "jila", "zilla", "state", "province"}:
+                        continue
+                values.add(field_value.original)
     return tuple(sorted(values))

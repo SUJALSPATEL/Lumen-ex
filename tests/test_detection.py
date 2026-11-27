@@ -19,6 +19,49 @@ class MultilingualPIIDetectorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.detector = MultilingualPIIDetector()
 
+    def test_zip_column_is_detected_without_classifying_clinical_numbers(self) -> None:
+        source = _source("registration/record.csv", InputFormat.CSV)
+        record = NormalizedRecord(
+            source=source,
+            locator="row:0",
+            fields={"district": "[LOCATION]", "Zip": "411001", "phone": "[REDACTED]"},
+            structure={"headers": ("district", "Zip", "phone")},
+        )
+        findings = self.detector.detect(record).findings
+        self.assertIn(
+            (DetectionEntityType.PIN_CODE, "Zip"),
+            {(finding.entity_type, finding.source_key) for finding in findings},
+        )
+
+        clinical = NormalizedRecord(
+            source=source,
+            locator="row:1",
+            fields={"lab_value": "140000", "field_10": "140000", "phone": "[REDACTED]"},
+            structure={"headers": ("lab_value", "field_10", "phone")},
+        )
+        self.assertFalse(any(
+            finding.entity_type is DetectionEntityType.PIN_CODE
+            for finding in self.detector.detect(clinical).findings
+        ))
+
+    def test_unlabeled_numeric_range_is_not_aadhaar(self) -> None:
+        record = NormalizedRecord(
+            source=_source("labs/ranges.json", InputFormat.JSON),
+            locator="doc",
+            fields={"range": "150000-410000", "note": "1234 5678 9012"},
+        )
+        findings = self.detector.detect(record).findings
+        self.assertFalse(any(
+            finding.entity_type is DetectionEntityType.AADHAAR
+            and finding.value == "150000-410000"
+            for finding in findings
+        ))
+        self.assertTrue(any(
+            finding.entity_type is DetectionEntityType.AADHAAR
+            and finding.value == "1234 5678 9012"
+            for finding in findings
+        ))
+
     def test_clinical_phrases_do_not_override_identity_evidence(self) -> None:
         record = NormalizedRecord(
             source=_source("notes/clinical.txt", InputFormat.TEXT),
@@ -434,6 +477,46 @@ class MultilingualPIIDetectorTests(unittest.TestCase):
 
         self.assertEqual(error.exception.code, "detection_structure_depth_exceeded")
         self.assertNotIn("PRIVATE-TEST-ID", str(error.exception))
+
+    def test_clinical_history_kco_and_location_fields_are_not_misclassified_as_names(self) -> None:
+        record = NormalizedRecord(
+            source=_source("discharge/note.txt", InputFormat.TEXT),
+            locator="doc",
+            fields={"text": "History: No K/C/O HTN.\nHistory: K/C/O TB\nNo other issues."},
+        )
+        result = self.detector.detect(record)
+        self.assertEqual(result.identifier_count, 0)
+
+        reg_record = NormalizedRecord(
+            source=_source("registration/reg.tsv", InputFormat.TSV),
+            locator="row:0",
+            fields={"Reg No": "JJH-0077305", "Village/Mohalla": "Amardih", "District": "Kanpur Dehat"},
+        )
+        reg_result = self.detector.detect(reg_record)
+        detected = {(f.entity_type, f.source_key) for f in reg_result.findings}
+        self.assertIn((DetectionEntityType.MEDICAL_RECORD_NUMBER, "Reg No"), detected)
+        self.assertIn((DetectionEntityType.LOCATION, "Village/Mohalla"), detected)
+        self.assertNotIn((DetectionEntityType.PATIENT_NAME, "District"), detected)
+
+        addr_record = NormalizedRecord(
+            source=_source("discharge/addr.txt", InputFormat.TEXT),
+            locator="doc",
+            fields={"text": "Address: H.No 12, Ward 10, Rampur, Distt. Hardoi - 261167\nBP: 120/80"},
+        )
+        addr_result = self.detector.detect(addr_record)
+        addr_values = [f.value for f in addr_result.findings if f.entity_type is DetectionEntityType.ADDRESS]
+        self.assertIn("H.No 12, Ward 10, Rampur, Distt. Hardoi - 261167", addr_values)
+
+        honorific_record = NormalizedRecord(
+            source=_source("discharge/hon.txt", InputFormat.TEXT),
+            locator="doc",
+            fields={"text": "Zainab amma is comfortable."},
+        )
+        hon_result = self.detector.detect(honorific_record)
+        self.assertIn(
+            (DetectionEntityType.PATIENT_NAME, "Zainab amma"),
+            {(f.entity_type, f.value) for f in hon_result.findings},
+        )
 
 
 def _source(path: str, file_format: InputFormat) -> InputFileMetadata:

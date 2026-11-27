@@ -60,6 +60,20 @@ _VERIFY_FINDING_TYPES = {
     DetectionEntityType.INSURANCE_ID,
     DetectionEntityType.OTHER_IDENTIFIER,
 }
+_RECORD_REDACT_NAME_TYPES = {
+    DetectionEntityType.PATIENT_NAME,
+    DetectionEntityType.RELATIVE_NAME,
+}
+_RECORD_REDACT_ID_TYPES = {
+    DetectionEntityType.PHONE,
+    DetectionEntityType.EMAIL,
+    DetectionEntityType.AADHAAR,
+    DetectionEntityType.ABHA,
+    DetectionEntityType.PAN,
+    DetectionEntityType.MEDICAL_RECORD_NUMBER,
+    DetectionEntityType.INSURANCE_ID,
+    DetectionEntityType.OTHER_IDENTIFIER,
+}
 _MAX_DEPTH = 100
 
 
@@ -192,14 +206,31 @@ class PrivacyTransformer:
 
         generalized_fields = self._location_generalizer.generalize(original_fields)
         date_order = self.config.date_order_for_source(record.source.relative_path)
+        consumed_indices: set[int] = set()
         transformed_fields = self._transform_tree(
             generalized_fields,
             path=(),
             findings=item.detection.findings,
+            consumed_indices=consumed_indices,
             patient_reference=patient_reference,
             date_order=date_order,
             depth=0,
         )
+        if not isinstance(transformed_fields, dict):
+            raise ProcessingError("invalid_record")
+        secondary_redactions = tuple(
+            dict.fromkeys(
+                (finding.entity_type, finding.value)
+                for index, finding in enumerate(item.detection.findings)
+                if index in consumed_indices
+                and len(finding.value) >= 4
+                and finding.entity_type in (_RECORD_REDACT_NAME_TYPES | _RECORD_REDACT_ID_TYPES)
+            )
+        )
+        if secondary_redactions:
+            transformed_fields = _redact_secondary_occurrences(
+                transformed_fields, secondary_redactions
+            )
         if not isinstance(transformed_fields, dict):
             raise ProcessingError("invalid_record")
         fields = transformed_fields
@@ -224,6 +255,7 @@ class PrivacyTransformer:
         *,
         path: tuple[str, ...],
         findings: tuple[DetectionFinding, ...],
+        consumed_indices: set[int] | None = None,
         patient_reference: str,
         date_order: DateOrder | None,
         depth: int,
@@ -232,9 +264,15 @@ class PrivacyTransformer:
             raise ProcessingError("privacy_structure_depth_exceeded")
         if isinstance(value, Mapping):
             transformed: dict[str, object] = {}
+            resource_type = value.get("resourceType")
+            context_path = (
+                path + (resource_type.casefold(),)
+                if isinstance(resource_type, str)
+                else path
+            )
             for original_key, child in value.items():
                 key = str(original_key)
-                key_path = path + (key,)
+                key_path = context_path + (key,)
                 key_findings = tuple(
                     finding
                     for finding in findings
@@ -248,6 +286,7 @@ class PrivacyTransformer:
                     child,
                     path=key_path,
                     findings=findings,
+                    consumed_indices=consumed_indices,
                     patient_reference=patient_reference,
                     date_order=date_order,
                     depth=depth + 1,
@@ -265,6 +304,7 @@ class PrivacyTransformer:
                     child,
                     path=path + (str(index),),
                     findings=findings,
+                    consumed_indices=consumed_indices,
                     patient_reference=patient_reference,
                     date_order=date_order,
                     depth=depth + 1,
@@ -277,6 +317,7 @@ class PrivacyTransformer:
                     child,
                     path=path + (str(index),),
                     findings=findings,
+                    consumed_indices=consumed_indices,
                     patient_reference=patient_reference,
                     date_order=date_order,
                     depth=depth + 1,
@@ -284,12 +325,14 @@ class PrivacyTransformer:
                 for index, child in enumerate(value)
             )
         if isinstance(value, str):
-            value_findings = tuple(
-                finding
-                for finding in findings
-                if finding.channel is DetectionChannel.VALUE
-                and _source_path_matches(finding.source_key, path)
-            )
+            value_findings = []
+            for index, finding in enumerate(findings):
+                if finding.channel is DetectionChannel.VALUE and _source_path_matches(
+                    finding.source_key, path
+                ):
+                    value_findings.append(finding)
+                    if consumed_indices is not None:
+                        consumed_indices.add(index)
             text = _rewrite_text(value, value_findings, self._age_generalizer)
             return self._date_shifter.shift_text(
                 text, patient_reference, date_order=date_order
@@ -368,6 +411,19 @@ def _rewrite_text(
                 ),
             )
         )
+        if (
+            finding.entity_type in {
+                DetectionEntityType.PATIENT_NAME,
+                DetectionEntityType.RELATIVE_NAME,
+            }
+            and len(finding.value) >= 4
+        ):
+            for repeated in re.finditer(
+                rf"(?<!\w){re.escape(finding.value)}(?!\w)", text
+            ):
+                replacements.append(
+                    (repeated.start(), repeated.end(), "[REDACTED]")
+                )
     replacements.sort(key=lambda item: (item[0], item[1]))
     merged: list[tuple[int, int, str]] = []
     for start, end, replacement in replacements:
@@ -404,35 +460,73 @@ def _replacement(
     return value
 
 
+def _redact_secondary_occurrences(
+    value: object,
+    redactions: tuple[tuple[DetectionEntityType, str], ...],
+) -> object:
+    """Redact secondary occurrences of already-matched identifiers across a record."""
+    if isinstance(value, str):
+        updated = value
+        for entity_type, sensitive_value in redactions:
+            if entity_type in _RECORD_REDACT_NAME_TYPES:
+                updated = re.sub(
+                    rf"(?<!\w){re.escape(sensitive_value)}(?!\w)",
+                    "[REDACTED]",
+                    updated,
+                )
+            else:
+                updated = updated.replace(sensitive_value, "[REDACTED]")
+        return updated
+    if isinstance(value, Mapping):
+        return {
+            key: _redact_secondary_occurrences(child, redactions)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_secondary_occurrences(child, redactions) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_secondary_occurrences(child, redactions) for child in value)
+    return value
+
+
 def _verify_findings_removed(
     findings: Sequence[DetectionFinding],
     fields: Mapping[str, object],
     structure: Mapping[str, object],
 ) -> None:
     sensitive_values = tuple(
-        finding.value
+        (finding.value, finding.entity_type in {
+            DetectionEntityType.PATIENT_NAME,
+            DetectionEntityType.RELATIVE_NAME,
+        })
         for finding in findings
         if finding.entity_type in _VERIFY_FINDING_TYPES
     )
-    for sensitive_value in sensitive_values:
+    for sensitive_value, whole_token in sensitive_values:
         if (
-            _contains_text(fields, sensitive_value)
-            or _contains_text(structure, sensitive_value)
+            _contains_text(fields, sensitive_value, whole_token=whole_token)
+            or _contains_text(structure, sensitive_value, whole_token=whole_token)
         ):
             raise ProcessingError("invalid_record")
 
 
-def _contains_text(value: object, needle: str) -> bool:
+def _contains_text(value: object, needle: str, *, whole_token: bool = False) -> bool:
     if isinstance(value, str):
         searchable = value.replace("[REDACTED]", "").replace("[LOCATION]", "")
+        if whole_token:
+            return re.search(rf"(?<!\w){re.escape(needle)}(?!\w)", searchable) is not None
         return needle in searchable
     if isinstance(value, Mapping):
         return any(
-            _contains_text(str(key), needle) or _contains_text(child, needle)
+            _contains_text(str(key), needle, whole_token=whole_token)
+            or _contains_text(child, needle, whole_token=whole_token)
             for key, child in value.items()
         )
     if isinstance(value, (list, tuple)):
-        return any(_contains_text(child, needle) for child in value)
+        return any(
+            _contains_text(child, needle, whole_token=whole_token)
+            for child in value
+        )
     return False
 
 

@@ -140,7 +140,7 @@ class SensitiveDataLeakScanner:
         result = self._detect(
             {
                 "text": _RELEASE_PSEUDONYM.sub(
-                    "", _RELEASE_PLACEHOLDER.sub("", text)
+                    "; ", _RELEASE_PLACEHOLDER.sub("; ", text)
                 )
             },
             headers=(),
@@ -185,14 +185,26 @@ class SensitiveDataLeakScanner:
         allow_cohort_quasi_identifiers: bool = False,
     ) -> bool:
         scan_text = _JSON_SHA256_FIELD.sub(r"\1[SHA256]\2", text)
-        if not self.scan_text(
+        suffix = Path(filename).suffix.casefold()
+        if suffix in {".json", ".jsonl", ".csv", ".tsv"}:
+            if not isinstance(scan_text, str) or not self._fits_utf8_limit(
+                scan_text, self.max_file_bytes
+            ):
+                return False
+            canaries = self._sensitive_canaries(sensitive_values)
+            if self._contains_canary(scan_text, canaries):
+                return False
+            if self._contains_canary(filename, canaries):
+                return False
+            if self._detect({"filename": filename}).identifier_count:
+                return False
+        elif not self.scan_text(
             scan_text,
             filename=filename,
             sensitive_values=sensitive_values,
             allow_cohort_quasi_identifiers=allow_cohort_quasi_identifiers,
         ):
             return False
-        suffix = Path(filename).suffix.casefold()
         if suffix == ".json":
             if not self._fits_utf8_limit(text, _MAX_STRUCTURED_BYTES):
                 return False
@@ -605,5 +617,5 @@ def _mask_release_tokens(value: object) -> object:
     if not isinstance(value, str):
         return value
     return _RELEASE_PSEUDONYM.sub(
-        "", _RELEASE_PLACEHOLDER.sub("", value)
+        "; ", _RELEASE_PLACEHOLDER.sub("; ", value)
     )

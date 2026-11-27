@@ -59,11 +59,13 @@ _NON_PATIENT_CONTEXTS = {
     "doctor",
     "facility",
     "hospital",
+    "lab",
     "medication",
     "drug",
     "disease",
     "condition",
     "diagnosis",
+    "panels",
     "procedure",
     "provider",
     "practitioner",
@@ -158,6 +160,8 @@ _KEY_TYPES: dict[DetectionEntityType, frozenset[str]] = {
             "medicalrecordnumber",
             "registrationnumber",
             "registrationid",
+            "regno",
+            "regnno",
             "ipdno",
             "ipdnumber",
             "opdno",
@@ -196,6 +200,7 @@ _KEY_TYPES: dict[DetectionEntityType, frozenset[str]] = {
         {
             "city",
             "village",
+            "villagemohalla",
             "tehsil",
             "district",
             "state",
@@ -211,7 +216,7 @@ _KEY_TYPES: dict[DetectionEntityType, frozenset[str]] = {
         }
     ),
     DetectionEntityType.PIN_CODE: frozenset(
-        {"pin", "pincode", "zipcode", "postalcode", "postal"}
+        {"pin", "pincode", "zip", "zipcode", "postalcode", "postal"}
     ),
     DetectionEntityType.OTHER_IDENTIFIER: frozenset(
         {"governmentid", "nationalid", "identifier", "insurance"}
@@ -222,7 +227,7 @@ _PHONE = re.compile(
     r"(?<![A-Za-z0-9])(?:\+?91[\s().-]*)?(?:0[\s().-]*)?[6-9\u0966-\u0969]"
     r"(?:[\s().-]*\d){9}(?![A-Za-z0-9])"
 )
-_AADHAAR = re.compile(r"(?<!\d)(?:\d[\s-]?){11}\d(?!\d)")
+_AADHAAR = re.compile(r"(?<!\d)(?:\d{12}|\d{4}[\s-]\d{4}[\s-]\d{4})(?!\d)")
 _MASKED_AADHAAR = re.compile(r"(?i)(?<!\w)X{4}[\s-]?X{4}[\s-]?\d{4}(?!\w)")
 _ABHA = re.compile(r"(?<!\d)\d{2}-\d{4}-\d{4}-\d{4}(?!\d)")
 _PAN = re.compile(r"(?i)(?<![A-Z0-9])[A-Z]{5}\d{4}[A-Z](?![A-Z0-9])")
@@ -245,7 +250,7 @@ _NAME_BEFORE_RELATIVE = re.compile(
 )
 _HONORIFIC_NAME = re.compile(
     r"(?<!\w)(?P<name>[A-Z][A-Za-z'.’\-]+|[\u0900-\u097f]+)"
-    r"[ \t]+(?P<title>(?i:ji|sahab|sahib|didi|behenji|bhai|babu))\b"
+    r"[ \t]+(?P<title>(?i:ji|sahab|sahib|didi|behenji|bhai|babu|amma))\b"
 )
 _PROPER_NAME_SEQUENCE = re.compile(
     r"(?<![\w])(?P<name>[A-Z][a-z]{1,}(?:[ '-][A-Z][a-z]{1,}){1,2})(?![\w])"
@@ -367,7 +372,7 @@ _PIN_LABEL = re.compile(
     r"\s*[:：=#-]?\s*(?P<value>[\d\u0966-\u096f]{6})(?!\d)"
 )
 _NOTE_ADDRESS_LINE = re.compile(
-    r"(?im)^[ \t]*(?:पता|address[ \t]*\([a-z -]{1,30}\))"
+    r"(?im)^[ \t]*(?:पता|address(?:[ \t]*\([a-z -]{1,30}\))?)"
     r"[ \t]*[:：=][ \t]*(?P<value>[^\r\n]+)"
 )
 _NOTE_HINDI_RECORD_NUMBERS = re.compile(
@@ -566,6 +571,7 @@ class MultilingualPIIDetector:
                     findings,
                     seen,
                     context=path,
+                    key_entity_type=entity_type,
                 )
 
         findings.sort(
@@ -596,6 +602,7 @@ class MultilingualPIIDetector:
         findings: list[DetectionFinding],
         seen: set[tuple[object, ...]],
         context: tuple[str, ...] = (),
+        key_entity_type: DetectionEntityType | None = None,
     ) -> None:
         if _is_non_patient_context(context):
             return
@@ -646,10 +653,11 @@ class MultilingualPIIDetector:
             )
         if channel is DetectionChannel.VALUE:
             for match in _NOTE_ADDRESS_LINE.finditer(text):
-                self._add_match(
-                    DetectionEntityType.ADDRESS, text, *match.span("value"),
-                    source_key, channel, findings, seen,
-                )
+                if any(ch.isalnum() for ch in match.group("value")):
+                    self._add_match(
+                        DetectionEntityType.ADDRESS, text, *match.span("value"),
+                        source_key, channel, findings, seen,
+                    )
             for match in _NOTE_HINDI_RECORD_NUMBERS.finditer(text):
                 for group in ("registration", "encounter"):
                     self._add_match(
@@ -712,6 +720,14 @@ class MultilingualPIIDetector:
                 candidate = match.group("name").strip()
                 if (
                     _is_clinical_history(text, match.start())
+                    or (
+                        match.group(0).lstrip().casefold().startswith("k")
+                        and re.search(
+                            r"(?i)(?:\bno|\bhistory\s*:)[ \t]+$",
+                            text[: match.start()],
+                        )
+                        is not None
+                    )
                     or _is_clinical_name(candidate)
                     or _is_generic_name(candidate)
                 ):
@@ -732,6 +748,8 @@ class MultilingualPIIDetector:
                     _is_clinician_context(text, match.start("name"))
                     or _is_clinical_name(candidate)
                     or _is_generic_name(candidate)
+                    or _is_missing(candidate)
+                    or _compact_key(candidate) in {"no", "known", "history"}
                 ):
                     continue
                 self._add_match(
@@ -753,13 +771,16 @@ class MultilingualPIIDetector:
                     DetectionEntityType.PATIENT_NAME,
                     text,
                     match.start(),
-                    match.end() if match.group("title").casefold() in {"bhai", "babu"} else match.end("name"),
+                    match.end() if match.group("title").casefold() in {"bhai", "babu", "amma"} else match.end("name"),
                     source_key,
                     channel,
                     findings,
                     seen,
                 )
-            if channel is DetectionChannel.VALUE:
+            if (
+                channel is DetectionChannel.VALUE
+                and key_entity_type is not DetectionEntityType.LOCATION
+            ):
                 for match in _PROPER_NAME_SEQUENCE.finditer(text):
                     candidate = match.group("name")
                     if (
