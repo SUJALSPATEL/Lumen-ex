@@ -1169,6 +1169,17 @@ def _insurance_issuer(owner: Mapping[str, object], key: str) -> str | None:
     return "PM-JAY" if not issuers and key == "pmjayid" else None
 
 
+def is_explicit_issuer_metadata(path: tuple[str, ...]) -> bool:
+    parents, field = path[:-1], _key_name(path[-1])
+    return (
+        (parents in {(), ("patient",)} and field in {
+            "hospitalname", "hospitalcode", "hospitalnamespace", "sourcesystem",
+            "sourcenamespace", "facilityid", "facilityname",
+        })
+        or (parents == ("_export_meta",) and field == "hospital")
+    )
+
+
 def _extract_source_systems(
     record: Mapping[str, object], config: PipelineConfig | None
 ) -> dict[str, str]:
@@ -1202,11 +1213,7 @@ def _extract_source_systems(
             if is_source_key:
                 candidate = _normalize_source_system(child)
                 if candidate is not None:
-                    verified_field = (not path and normalized_key in {
-                        "hospitalname", "hospitalcode", "hospitalnamespace",
-                        "sourcesystem", "sourcenamespace", "facilityid", "facilityname",
-                    }) or (path == ("_export_meta",) and normalized_key == "hospital")
-                    if config is not None and verified_field:
+                    if config is not None and is_explicit_issuer_metadata(child_path):
                         values[candidate] = config.issuer_namespace("metadata", candidate)
                     else:
                         values.setdefault(candidate, candidate)

@@ -23,7 +23,7 @@ from lumen_ex.contracts.models import (
     ParsedRecord,
 )
 from lumen_ex.errors import ProcessingError
-from lumen_ex.identity import is_json_envelope_identity
+from lumen_ex.identity import is_explicit_issuer_metadata, is_json_envelope_identity
 
 
 _HASH_CHUNK_SIZE = 1024 * 1024
@@ -556,19 +556,9 @@ def _json_identity_contexts(
             if owner not in owners:
                 continue
             tail = event_path[length:]
-            first = tail[0]
-            if not isinstance(first, str):
-                continue
             if any(not isinstance(part, str) for part in tail):
                 continue
-            key = first.casefold().replace("_", "")
-            patient_field = is_json_envelope_identity(tail)
-            export_hospital = key == "exportmeta" and tail[1:] == ("hospital",)
-            source_field = len(tail) == 1 and key in {
-                "hospitalname", "hospitalcode", "hospitalnamespace", "sourcesystem",
-                "sourcenamespace", "facilityid", "facilityname",
-            }
-            if not (patient_field or export_hospital or source_field):
+            if not (is_json_envelope_identity(tail) or is_explicit_issuer_metadata(tail)):
                 continue
             target = contexts.setdefault(owner, {})
             for part in tail[:-1]:

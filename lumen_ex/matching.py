@@ -290,6 +290,12 @@ class IdentityMatcher:
         best_relative_similarity = 0.0
         has_stored_name = False
         has_stored_dob = False
+        insurance_by_issuer: dict[str, set[str]] = {}
+        for value in identity.insurance_identifier:
+            if value.namespace and value.normalized:
+                insurance_by_issuer.setdefault(value.namespace, set()).add(value.normalized)
+        compared_issuers: set[str] = set()
+        matching_issuers: set[str] = set()
         for field_name, stored_value in self.registry.iter_identity_values(patient_id):
             normalized = stored_value.normalized
             if normalized is None:
@@ -339,12 +345,12 @@ class IdentityMatcher:
                 ):
                     exact_fields.add(field_name)
             elif field_name == "insurance_identifier":
-                if stored_value.namespace and any(
-                    current.normalized == normalized
-                    and current.namespace == stored_value.namespace
-                    for current in identity.insurance_identifier
-                ):
-                    exact_fields.add(field_name)
+                issuer = stored_value.namespace
+                if issuer and issuer in insurance_by_issuer:
+                    compared_issuers.add(issuer)
+                    if normalized in insurance_by_issuer[issuer]:
+                        matching_issuers.add(issuer)
+                        exact_fields.add(field_name)
             elif normalized in values.get(field_name, set()):
                 exact_fields.add(field_name)
 
@@ -366,7 +372,9 @@ class IdentityMatcher:
         ):
             evidence.add("dob_conflict")
 
-        hard_conflict = False
+        hard_conflict = bool(compared_issuers - matching_issuers)
+        if hard_conflict:
+            evidence.add("insurance_identifier_conflict")
         for identifier in identity.hospital_identifier:
             identifier_namespace = _identifier_namespace(
                 identifier, identity.source_system, self.hospital_namespace
@@ -618,9 +626,11 @@ def _name_similarity(first: str, second: str) -> float:
 
 def _has_independent_support(evidence: tuple[str, ...]) -> bool:
     evidence_set = set(evidence)
+    # A shared household phone can retrieve candidates but cannot establish identity.
     strong_identifier = bool(
         evidence_set & {
-            f"{field}_exact" for field in _STRONG_IDENTIFIERS - {"hospital_identifier"}
+            f"{field}_exact"
+            for field in _STRONG_IDENTIFIERS - {"hospital_identifier", "phone"}
         }
     )
     name_support = "name_similar" in evidence_set

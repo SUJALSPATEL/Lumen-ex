@@ -1,7 +1,7 @@
 """Cohort orchestration for producing a validated sanitized release."""
 
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import logging
 from pathlib import Path
@@ -252,6 +252,9 @@ class ReleasePipeline:
         source_namespaces = _source_namespaces_by_file(
             records, normalized_by_record
         )
+        original_decisions: dict[
+            tuple[str, str], tuple[NormalizedRecord, str, LinkageDecision]
+        ] = {}
         for parsed in records:
             key = (parsed.source.relative_path, parsed.locator)
             normalized = NormalizedRecord(
@@ -277,7 +280,20 @@ class ReleasePipeline:
                 namespace = source_namespaces[parsed.source.relative_path]
                 if namespace not in matchers:
                     matchers[namespace] = IdentityMatcher(registry, hospital_namespace=namespace)
-                linkage, linked = self._link_record(normalized, matchers[namespace], registry)
+                record_key = (parsed.source.sha256, parsed.locator)
+                original = original_decisions.get(record_key)
+                if original is None:
+                    linkage, linked = self._link_record(normalized, matchers[namespace], registry)
+                    original_decisions[record_key] = (normalized, namespace, linkage)
+                else:
+                    previous, previous_namespace, previous_linkage = original
+                    # Byte-identical exports can have different source-specific
+                    # date rules. Replay only an equivalent identity projection.
+                    if previous_namespace == namespace and normalized.identities == tuple(
+                        replace(identity, source_file=parsed.source.relative_path)
+                        for identity in previous.identities
+                    ):
+                        linkage = previous_linkage
                 privacy_indices.append(len(prepared))
                 privacy_inputs.append(
                     PrivacyInput(
@@ -389,27 +405,28 @@ class ReleasePipeline:
             )
             return LinkageDecision(LinkageAction.ABSTAIN), False
 
-        patient_id = match.patient_id
-        if match.decision is IdentityDecision.CREATE:
-            patient_id = registry.create_patient(
-                record.source.sha256, record.locator
+        with registry.transaction():
+            patient_id = match.patient_id
+            if match.decision is IdentityDecision.CREATE:
+                patient_id = registry.create_patient(
+                    record.source.sha256, record.locator
+                )
+            if patient_id is None:
+                raise ProcessingError("registry_reference_invalid")
+            registry.add_record_mapping(
+                record.source.sha256,
+                record.locator,
+                patient_id,
+                match.decision,
+                match.confidence,
             )
-        if patient_id is None:
-            raise ProcessingError("registry_reference_invalid")
-        registry.add_record_mapping(
-            record.source.sha256,
-            record.locator,
-            patient_id,
-            match.decision,
-            match.confidence,
-        )
-        registry.add_identity(
-            patient_id,
-            record.source.sha256,
-            identity,
-            namespace=matcher.hospital_namespace,
-            record_locator=record.locator,
-        )
+            registry.add_identity(
+                patient_id,
+                record.source.sha256,
+                identity,
+                namespace=matcher.hospital_namespace,
+                record_locator=record.locator,
+            )
         return (
             LinkageDecision(LinkageAction.LINK, patient_id),
             match.decision is IdentityDecision.LINK,

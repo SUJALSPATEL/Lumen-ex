@@ -573,7 +573,7 @@ class IdentityMatcherTests(unittest.TestCase):
         self.assertEqual(result.reason, "hard_identifier_conflict")
         self.assertIsNone(result.patient_id)
 
-    def test_multilingual_transliteration_variants_link_with_strong_identifier(self) -> None:
+    def test_multilingual_transliteration_variants_link_with_corroborated_identity(self) -> None:
         positive_cases = (
             ("Sanjay Verma", "संजय वर्मा", "+919876543210", None),
             ("Ram Singh", "राम सिंह", "+919876543211", None),
@@ -587,12 +587,13 @@ class IdentityMatcherTests(unittest.TestCase):
         )
         for index, (stored_name, incoming_name, phone, mrn) in enumerate(positive_cases):
             with self.subTest(stored=stored_name, incoming=incoming_name):
+                dob = f"1982-04-{index + 1:02d}" if phone else None
                 expected = self._store(
                     f"pos:{index}:0",
                     _identity(
                         f"pos:{index}:0",
                         name=stored_name,
-                        dob=None,
+                        dob=dob,
                         phone=phone,
                         hospital_id=mrn,
                     ),
@@ -601,7 +602,7 @@ class IdentityMatcherTests(unittest.TestCase):
                     _identity(
                         f"pos:{index}:1",
                         name=incoming_name,
-                        dob=None,
+                        dob=dob,
                         phone=phone,
                         hospital_id=mrn,
                     )
