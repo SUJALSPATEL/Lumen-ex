@@ -6,8 +6,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from lumen_ex.config import PipelineConfig
-from lumen_ex.errors import ProcessingError
+from lumen_ex.config import PipelineConfig, load_config
+from lumen_ex.errors import ConfigurationError, ProcessingError
 from lumen_ex.contracts.models import (
     InputFileMetadata,
     InputFormat,
@@ -26,6 +26,71 @@ from lumen_ex.identity import PatientIdentityNormalizer
 
 
 class SanitizedOutputWriterTests(unittest.TestCase):
+    def test_verified_issuers_link_across_files_and_remain_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "input"
+            source.mkdir()
+            policy = root / "policy.yaml"
+            policy.write_text(
+                "issuer_aliases: metadata|LegacyEast=issuer-east, "
+                "metadata|ExportEast=issuer-east, metadata|Other=issuer-west\n",
+                encoding="utf-8",
+            )
+            config = load_config(policy)
+            policy.write_text(
+                "issuer_aliases: metadata|LegacyEast=issuer-east, metadata|LegacyEast=issuer-west\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ConfigurationError):
+                load_config(policy)
+
+            files = (
+                ("a.json", "LegacyEast"),
+                ("b.json", "ExportEast"),
+                ("c.json", "Other"),
+                ("d.json", None),
+                ("e.json", None),
+                ("f.json", "LegacyEast"),
+            )
+            for index, (filename, issuer) in enumerate(files):
+                record = {"patient_name": "Asha Sharma", "mrn": "H-102", "value": 12 + index}
+                if issuer:
+                    record["hospital_code"] = issuer
+                (source / filename).write_text(json.dumps(record), encoding="utf-8")
+
+            def released(label, secret):
+                output = root / label
+                report = ReleasePipeline(
+                    source, output, config, secret, SensitiveDataLeakScanner()
+                ).run()
+                records = {
+                    row["file"]: row["patient"]
+                    for row in map(json.loads, (output / "records.jsonl").read_text().splitlines())
+                }
+                return {
+                    entry.input_sha256: (entry.output, records[entry.output])
+                    for entry in report.files if entry.output
+                }
+
+            first = released("first", "synthetic-secret")
+            self.assertEqual(first, released("repeat", "synthetic-secret"))
+            rotated = released("rotated", "rotated-secret")
+            hashes = [hashlib.sha256((source / filename).read_bytes()).hexdigest() for filename, _ in files]
+            self.assertEqual(set(first), set(hashes))
+            self.assertEqual(set(first), set(rotated))
+            for released_records in (first, rotated):
+                a, b, c, d, e, f = [released_records[digest][1] for digest in hashes]
+                self.assertTrue(all((a, b, d, e, f)))
+                self.assertEqual(a, b)
+                self.assertEqual(a, f)
+                self.assertIsNone(c)
+                self.assertEqual(len({a, d, e}), 3)
+            for digest in hashes:
+                self.assertNotEqual(first[digest][0], rotated[digest][0])
+                if first[digest][1] is not None:
+                    self.assertNotEqual(first[digest][1], rotated[digest][1])
+
     def test_sibling_lab_outputs_share_a_patient_and_exclude_parent_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

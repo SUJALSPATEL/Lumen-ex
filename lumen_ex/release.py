@@ -9,7 +9,7 @@ import platform
 import time
 from typing import Sequence
 
-from lumen_ex.config import PipelineConfig
+from lumen_ex.config import CANONICAL_ISSUER_PREFIX, PipelineConfig
 from lumen_ex.contracts.identity import IdentityDecision
 from lumen_ex.contracts.models import (
     DetectionEntityType,
@@ -446,9 +446,10 @@ def _source_namespaces_by_file(
     for parsed in records:
         relative_path = parsed.source.relative_path
         source_candidates = candidates[relative_path]
+        issuer = next(iter(source_candidates)) if len(source_candidates) == 1 else None
+        # A configured alias requires provenance on the identity itself.
         namespaces[relative_path] = (
-            next(iter(source_candidates))
-            if len(source_candidates) == 1
+            issuer if issuer and not issuer.startswith(CANONICAL_ISSUER_PREFIX)
             else f"file:{parsed.source.sha256}"
         )
     return namespaces

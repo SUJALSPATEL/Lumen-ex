@@ -3,9 +3,13 @@
 from dataclasses import dataclass
 from pathlib import Path
 from pathlib import PurePosixPath
+import re
+import unicodedata
 
 from lumen_ex.errors import ConfigurationError
 from lumen_ex.value_normalization import AmbiguousDateAction, DateOrder
+
+CANONICAL_ISSUER_PREFIX = "issuer-alias\x00"
 
 
 @dataclass(frozen=True)
@@ -20,6 +24,7 @@ class PipelineConfig:
         ("registration/arogya_legacy_export", "mdy"),
     )
     ambiguous_date_action: AmbiguousDateAction = "redact"
+    issuer_aliases: tuple[tuple[str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         numeric = (
@@ -88,6 +93,37 @@ class PipelineConfig:
                 raise ConfigurationError("configuration_value_invalid")
             seen_prefixes.add(normalized_prefix)
 
+        aliases: set[tuple[str, str]] = set()
+        if not isinstance(self.issuer_aliases, tuple):
+            raise ConfigurationError("configuration_value_invalid")
+        for entry in self.issuer_aliases:
+            if (
+                not isinstance(entry, tuple)
+                or len(entry) != 3
+                or any(not isinstance(part, str) for part in entry)
+            ):
+                raise ConfigurationError("configuration_value_invalid")
+            kind, alias, issuer = entry
+            if (
+                kind not in {"metadata", "fhir"}
+                or not alias
+                or alias.casefold() in {"na", "n/a", "nil", "none", "null", "unknown", "-", "--"}
+                or len(alias) > 2048
+                or alias != " ".join(unicodedata.normalize("NFKC", alias).split())
+                or any(unicodedata.category(character) == "Cc" for character in alias)
+                or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", issuer)
+                or (kind, alias) in aliases
+            ):
+                raise ConfigurationError("configuration_value_invalid")
+            aliases.add((kind, alias))
+
+    def issuer_namespace(self, kind: str, issuer: str) -> str:
+        for alias_kind, alias, canonical in self.issuer_aliases:
+            if (alias_kind, alias) == (kind, issuer):
+                # Source issuer normalization rejects control characters.
+                return CANONICAL_ISSUER_PREFIX + canonical
+        return issuer
+
     def date_order_for_source(self, relative_path: str) -> DateOrder | None:
         """Return the most-specific configured date order for a source path."""
         normalized_path = relative_path.replace("\\", "/").casefold()
@@ -109,6 +145,7 @@ _EXPECTED_KEYS = {
     "location_hierarchy",
     "date_order_overrides",
     "ambiguous_date_action",
+    "issuer_aliases",
 }
 
 
@@ -120,6 +157,7 @@ def load_config(path: Path | str | None = None) -> PipelineConfig:
         int
         | tuple[str, ...]
         | tuple[tuple[str, DateOrder], ...]
+        | tuple[tuple[str, str, str], ...]
         | AmbiguousDateAction,
     ] = {}
     try:
@@ -179,6 +217,16 @@ def load_config(path: Path | str | None = None) -> PipelineConfig:
             else:
                 raise ConfigurationError("configuration_value_invalid")
             continue
+        if key == "issuer_aliases":
+            issuer_aliases = []
+            for item in value.split(",") if value else ():
+                kind, type_separator, assignment = item.partition("|")
+                alias, separator, issuer = assignment.rpartition("=")
+                if not type_separator or not separator:
+                    raise ConfigurationError("configuration_value_invalid")
+                issuer_aliases.append((kind.strip(), alias.strip(), issuer.strip()))
+            values[key] = tuple(issuer_aliases)
+            continue
         try:
             values[key] = int(value)
         except ValueError:
@@ -197,6 +245,7 @@ def load_config(path: Path | str | None = None) -> PipelineConfig:
     ambiguous_date_action = values.get(
         "ambiguous_date_action", defaults.ambiguous_date_action
     )
+    issuer_aliases = values.get("issuer_aliases", defaults.issuer_aliases)
     if not isinstance(location_hierarchy, tuple):
         raise ConfigurationError("configuration_value_invalid")
     if not isinstance(date_order_overrides, tuple):
@@ -215,6 +264,7 @@ def load_config(path: Path | str | None = None) -> PipelineConfig:
         location_hierarchy=location_hierarchy,
         date_order_overrides=date_order_overrides,
         ambiguous_date_action=ambiguous_date_action,
+        issuer_aliases=issuer_aliases,
     )
 
 

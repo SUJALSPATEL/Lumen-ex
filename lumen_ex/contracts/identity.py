@@ -51,6 +51,7 @@ class PatientIdentity:
     source_system: str | None = field(default=None, repr=False)
     context_conflict: bool = False
     inherited_fields: frozenset[str] = frozenset()
+    reference_source_system: str | None = field(default=None, repr=False)
 
 
 __all__ = [

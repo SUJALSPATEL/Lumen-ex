@@ -14,7 +14,7 @@ from typing import TypeAlias
 import phonenumbers
 from phonenumbers import NumberParseException, PhoneNumberFormat
 
-from lumen_ex.config import PipelineConfig
+from lumen_ex.config import CANONICAL_ISSUER_PREFIX, PipelineConfig
 from lumen_ex.contracts.identity import IdentityValue, PatientIdentity
 from lumen_ex.contracts.models import (
     InputFormat,
@@ -503,27 +503,47 @@ def extract_identity(
     *,
     date_order: DateOrder | None = None,
     source_namespace: str | None = None,
+    reference_namespace: str | None = None,
+    config: PipelineConfig | None = None,
 ) -> PatientIdentity:
     """Project one parsed row/object or labeled note into identity-only values."""
     source_system: str | None = None
+    reference_source: str | None = None
     systems: set[str] = set()
     if isinstance(record, str):
         candidates = _extract_note_values(record)
     elif isinstance(record, Mapping):
         if record.get("resourceType") == "Patient":
             candidates = _extract_fhir_patient(record)
+            if config is not None:
+                candidates["hospital_identifier"] = [
+                    (raw, key, config.issuer_namespace("fhir", namespace) if namespace else None)
+                    for raw, key, namespace in candidates["hospital_identifier"]
+                ]
             source_system = _single_identifier_namespace(candidates)
+            if (
+                source_system and source_system.startswith(CANONICAL_ISSUER_PREFIX)
+                and any(not namespace for _, _, namespace in candidates["hospital_identifier"])
+            ):
+                source_system = None
             date_order = None
         else:
             candidates = _extract_mapping_values(record)
-            systems = _extract_source_systems(record)
+            issuer_scopes = _extract_source_systems(record, config)
+            systems = set(issuer_scopes.values())
             source_system = next(iter(systems)) if len(systems) == 1 else None
             source_system = source_system or (source_namespace if not systems else None)
+            if len(issuer_scopes) == 1:
+                reference_source = next(iter(issuer_scopes))
+            elif not issuer_scopes:
+                reference_source = reference_namespace
+                if config is None or not config.issuer_aliases:
+                    reference_source = reference_source or source_namespace
             reference = record.get("patient_ref")
-            if source_system and isinstance(reference, str) and _normalize_patient_reference(reference):
+            if reference_source and isinstance(reference, str) and _normalize_patient_reference(reference):
                 _append(
                     candidates, "hospital_identifier", reference, "patient_ref",
-                    namespace=f"patient-ref:{source_system}",
+                    namespace=f"patient-ref:{reference_source}",
                 )
     else:
         raise TypeError("identity_record_type_invalid")
@@ -531,7 +551,10 @@ def extract_identity(
     identity = _build_identity(
         candidates, source_file, record_locator, source_system, date_order
     )
-    return replace(identity, context_conflict=True) if len(systems) > 1 else identity
+    if reference_source or len(systems) > 1:
+        return replace(identity, reference_source_system=reference_source,
+                       context_conflict=len(systems) > 1)
+    return identity
 
 
 class PatientIdentityNormalizer:
@@ -550,6 +573,7 @@ class PatientIdentityNormalizer:
                 values,
                 record.source.relative_path,
                 record.locator,
+                config=self.config,
             )
         elif record.source.detected_format is InputFormat.TEXT and isinstance(
             values, Mapping
@@ -568,11 +592,15 @@ class PatientIdentityNormalizer:
                 current = extract_identity(
                     context, source, record.locator, date_order=order,
                     source_namespace=parent.source_system if parent else None,
+                    reference_namespace=parent.reference_source_system if parent else None,
+                    config=self.config,
                 )
                 parent = _inherit_identity(current, parent)
             child = extract_identity(
                 values, source, record.locator, date_order=order,
                 source_namespace=parent.source_system if parent else None,
+                reference_namespace=parent.reference_source_system if parent else None,
+                config=self.config,
             )
             identities = (_inherit_identity(child, parent),)
         elif isinstance(values, str):
@@ -600,10 +628,12 @@ def extract_fhir_identities(
     resource: Mapping[str, object],
     source_file: str,
     record_locator: str = "doc",
+    *,
+    config: PipelineConfig | None = None,
 ) -> tuple[PatientIdentity, ...]:
     """Extract one identity per Patient resource in a FHIR R4 resource or Bundle."""
     if resource.get("resourceType") == "Patient":
-        return (extract_identity(resource, source_file, record_locator),)
+        return (extract_identity(resource, source_file, record_locator, config=config),)
     if resource.get("resourceType") != "Bundle":
         return ()
 
@@ -624,6 +654,7 @@ def extract_fhir_identities(
                 f"{record_locator.rstrip('/')}/entry/{index}/resource"
                 if record_locator != "doc"
                 else f"/entry/{index}/resource",
+                config=config,
             )
         )
     return tuple(identities)
@@ -1138,8 +1169,10 @@ def _insurance_issuer(owner: Mapping[str, object], key: str) -> str | None:
     return "PM-JAY" if not issuers and key == "pmjayid" else None
 
 
-def _extract_source_systems(record: Mapping[str, object]) -> set[str]:
-    values: set[str] = set()
+def _extract_source_systems(
+    record: Mapping[str, object], config: PipelineConfig | None
+) -> dict[str, str]:
+    values: dict[str, str] = {}
     stack: list[tuple[object, tuple[str, ...], int]] = [(record, (), 0)]
     while stack:
         value, path, depth = stack.pop()
@@ -1169,7 +1202,14 @@ def _extract_source_systems(record: Mapping[str, object]) -> set[str]:
             if is_source_key:
                 candidate = _normalize_source_system(child)
                 if candidate is not None:
-                    values.add(candidate)
+                    verified_field = (not path and normalized_key in {
+                        "hospitalname", "hospitalcode", "hospitalnamespace",
+                        "sourcesystem", "sourcenamespace", "facilityid", "facilityname",
+                    }) or (path == ("_export_meta",) and normalized_key == "hospital")
+                    if config is not None and verified_field:
+                        values[candidate] = config.issuer_namespace("metadata", candidate)
+                    else:
+                        values.setdefault(candidate, candidate)
             if isinstance(child, (Mapping, list, tuple)):
                 stack.append((child, child_path, depth + 1))
     return values

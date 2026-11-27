@@ -3,6 +3,7 @@ from pathlib import Path
 import unicodedata
 import unittest
 
+from lumen_ex.config import PipelineConfig
 from lumen_ex.contracts.identity import PatientIdentity
 from lumen_ex.contracts.models import InputFileMetadata, InputFormat, ParsedRecord
 from lumen_ex.identity import (
@@ -19,6 +20,7 @@ from lumen_ex.identity import (
 )
 from lumen_ex.detection.indic_names import names_match, normalize_name
 from lumen_ex.errors import ProcessingError
+from lumen_ex.release import _source_namespaces_by_file
 
 
 _FIXTURES = Path(__file__).parent / "fixtures" / "identity_examples.json"
@@ -88,6 +90,65 @@ class ScalarNormalizationTests(unittest.TestCase):
 
 
 class IdentityExtractionTests(unittest.TestCase):
+    def test_verified_issuer_aliases_distinguish_provenance_and_reference_scope(self) -> None:
+        config = PipelineConfig(issuer_aliases=(
+            ("metadata", "Legacy A", "hospital-a"),
+            ("metadata", "Export A", "hospital-a"),
+            ("fhir", "urn:hospital:records", "hospital-a"),
+        ))
+        first = extract_identity({
+            "hospital_code": "Legacy A", "MRN": "A-01", "patient_ref": "REF-1",
+        }, "first.json", config=config)
+        second = extract_identity({
+            "_export_meta": {"hospital": "Export A"}, "MRN": "A-01", "patient_ref": "REF-1",
+        }, "second.json", config=config)
+        fhir, = extract_fhir_identities({
+            "resourceType": "Bundle",
+            "entry": [{"resource": {
+                "resourceType": "Patient",
+                "identifier": [{"system": "urn:hospital:records", "value": "A-01"}],
+            }}],
+        }, "third.json", config=config)
+        self.assertEqual(first.source_system, second.source_system)
+        self.assertEqual(first.source_system, fhir.hospital_identifier[0].namespace)
+        references = [
+            next(value.namespace for value in identity.hospital_identifier
+                 if value.source_key == "patient_ref")
+            for identity in (first, second)
+        ]
+        self.assertNotEqual(references[0], references[1])
+        conflicting = extract_identity({
+            "hospital_code": "Legacy A", "hospital_name": "Different Hospital", "MRN": "A-01",
+        }, "conflict.json", config=config)
+        self.assertTrue(conflicting.context_conflict)
+        unknown = extract_identity({"provider": {"name": "Legacy A"}, "MRN": "A-01"},
+                                   "unknown.json", config=config)
+        self.assertNotEqual(unknown.source_system, first.source_system)
+        mixed = extract_identity({
+            "resourceType": "Patient",
+            "identifier": [
+                {"system": "urn:hospital:records", "value": "A-01"},
+                {"value": "B-02"},
+            ],
+        }, "mixed.json", config=config)
+        self.assertIsNone(mixed.source_system)
+        self.assertTrue(any(value.namespace is None for value in mixed.hospital_identifier))
+
+        source = InputFileMetadata("mixed-source.json", "a" * 64, 128, detected_format=InputFormat.JSON)
+        records = (
+            ParsedRecord(source, "/items/0", {"hospital_code": "Legacy A", "MRN": "A-01"}),
+            ParsedRecord(source, "/items/1", {"MRN": "A-01"}),
+        )
+        normalizer = PatientIdentityNormalizer(config)
+        normalized = {
+            (source.relative_path, record.locator): normalizer.normalize(record)
+            for record in records
+        }
+        self.assertEqual(_source_namespaces_by_file(records, normalized),
+                         {source.relative_path: f"file:{source.sha256}"})
+        self.assertIsNone(normalized[source.relative_path, "/items/1"]
+                          .identities[0].hospital_identifier[0].namespace)
+
     def test_multilingual_note_labels_and_patient_headers(self) -> None:
         labeled = extract_identity(
             "मरीज़ का नाम — आशा शर्मा\r\n"
